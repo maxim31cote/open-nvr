@@ -11,11 +11,21 @@ one camera per path, skipping paths that already have a camera. The new cameras
 behave like any other: live view, recording, playback and Tier-0 detection all
 work on them with no further configuration.
 
+The rig picks up new clips on its own, so re-run this whenever you have added
+some — or leave it running with FAKECAM_WATCH=1 and it registers each new
+stream as it appears:
+
+    docker exec -e FAKECAM_WATCH=1 -i opennvr_core \
+        python - < scripts/fakecams/register_fake_cameras.py
+
 Environment knobs:
     FAKECAM_HOST   host:port of the rig's API      (default fakecams:9997)
     FAKECAM_IP     address cameras are stored with (default 172.28.90.10)
     FAKECAM_PORT   RTSP port                       (default 8554)
     FAKECAM_PREFIX camera-name prefix              (default "fake-")
+    FAKECAM_WATCH  keep running, registering new streams as the rig serves
+                   them (default off; Ctrl-C to stop)
+    FAKECAM_WATCH_INTERVAL  seconds between checks in watch mode (default 10)
     FAKECAM_SKILL  optional skill to assign to every new camera (default: none).
                    Set it when testing a capability that scopes itself by
                    assignment, e.g. FAKECAM_SKILL=license_plate_recognition
@@ -25,6 +35,7 @@ Environment knobs:
 import json
 import os
 import sys
+import time
 import urllib.error
 import urllib.request
 import warnings
@@ -46,6 +57,8 @@ CAM_IP = os.environ.get("FAKECAM_IP", "172.28.90.10")
 CAM_PORT = int(os.environ.get("FAKECAM_PORT", "8554"))
 SKILL = os.environ.get("FAKECAM_SKILL", "")
 PREFIX = os.environ.get("FAKECAM_PREFIX", "fake-")
+WATCH = os.environ.get("FAKECAM_WATCH", "").lower() in ("1", "true", "yes", "on")
+WATCH_INTERVAL = int(os.environ.get("FAKECAM_WATCH_INTERVAL", "10"))
 
 
 def request(method, url, token=None, body=None):
@@ -67,7 +80,7 @@ def request(method, url, token=None, body=None):
             return exc.code, raw
 
 
-def admin_token():
+def admin_token(quiet=False):
     """Mint an access token for the first active superuser (else any user)."""
     db = SessionLocal()
     try:
@@ -79,19 +92,29 @@ def admin_token():
         ) or db.query(User).filter(User.is_active.is_(True)).order_by(User.id).first()
         if user is None:
             sys.exit("No active user in the database — finish the setup wizard first.")
-        print(f"acting as user '{user.username}'")
+        if not quiet:
+            print(f"acting as user '{user.username}'")
         return create_access_token({"sub": user.username})
     finally:
         db.close()
 
 
-def rig_paths():
+def rig_paths(fatal=True):
+    """Streams the rig is serving, as (name, ready) pairs.
+
+    Returns None instead of exiting when fatal is False — watch mode has to
+    survive the rig being restarted underneath it.
+    """
     status, body = request("GET", f"http://{RIG}/v3/paths/list?itemsPerPage=1000")
     if status != 200 or not isinstance(body, dict):
-        sys.exit(
+        msg = (
             f"Could not read the fake-camera rig at {RIG} (HTTP {status}). "
             "Is it up?  docker compose ... --profile fakecams up -d fakecams"
         )
+        if fatal:
+            sys.exit(msg)
+        print(msg)
+        return None
     names = []
     for item in body.get("items") or []:
         name = item.get("name")
@@ -101,15 +124,8 @@ def rig_paths():
     return sorted(names)
 
 
-def main():
-    token = admin_token()
-    paths = rig_paths()
-    if not paths:
-        sys.exit(
-            f"The rig at {RIG} is serving no streams — check that your video "
-            "files are in the folder bound to /videos, then restart it."
-        )
-
+def register(token, paths):
+    """Create a camera for every rig path that does not have one yet."""
     status, existing = request(
         "GET", f"{API}/cameras/?limit=500&active_only=false", token
     )
@@ -155,12 +171,41 @@ def main():
             if status != 200:
                 print(f"     !! could not assign '{SKILL}' (HTTP {status}): {body}")
 
-    print()
-    print(f"created {len(created)} camera(s); {len(skipped)} already present")
-    if SKILL and created:
-        print(f"assigned skill '{SKILL}' to every new camera")
-    if skipped:
-        print("already present: " + ", ".join(skipped))
+    return created, skipped
+
+
+def main():
+    token = admin_token()
+
+    if not WATCH:
+        paths = rig_paths()
+        if not paths:
+            sys.exit(
+                f"The rig at {RIG} is serving no streams — check that your video "
+                "files are in the folder bound to /videos, then restart it."
+            )
+        created, skipped = register(token, paths)
+        print()
+        print(f"created {len(created)} camera(s); {len(skipped)} already present")
+        if SKILL and created:
+            print(f"assigned skill '{SKILL}' to every new camera")
+        if skipped:
+            print("already present: " + ", ".join(skipped))
+        return
+
+    print(f"watching {RIG} every {WATCH_INTERVAL}s — Ctrl-C to stop")
+    try:
+        while True:
+            paths = rig_paths(fatal=False)
+            if paths:
+                # Re-minted every pass: a watch left running overnight outlives
+                # the access token's expiry.
+                created, _ = register(admin_token(quiet=True), paths)
+                if created and SKILL:
+                    print(f"     assigned '{SKILL}' to {len(created)} new camera(s)")
+            time.sleep(WATCH_INTERVAL)
+    except KeyboardInterrupt:
+        print("\nstopped")
 
 
 if __name__ == "__main__":

@@ -7,15 +7,21 @@
 # anything you would normally need a camera for: live view, recording and
 # playback, Tier-0 detection, the event timeline, or any installed app.
 #
-#     ./data/fake-cameras/gate-entry.mp4
+#     ./data/fake-cameras/gate-entry.mp4      one file   -> one camera
 #         -> rtsp://172.28.90.10:8554/gate-entry
+#     ./data/fake-cameras/parking/*.mp4       one folder -> one camera,
+#         -> rtsp://172.28.90.10:8554/parking    every clip in it, on a loop
+#
+# The folder is rescanned every few seconds while the rig runs, so a clip or
+# folder you drop in appears as a stream without restarting anything.
 #
 # Usage:
 #     # 1. drop your clips in ./data/fake-cameras (or point FAKECAM_VIDEO_DIR
 #     #    at any host folder)
 #     docker compose -f docker-compose.yml -f docker-compose.fakecams.yml \
 #         --profile fakecams up -d fakecams
-#     # 2. register them as OpenNVR cameras
+#     # 2. register them as OpenNVR cameras (re-run it after adding more;
+#     #    add -e FAKECAM_WATCH=1 to keep registering new ones as they appear)
 #     docker exec -i opennvr_core python - < scripts/fakecams/register_fake_cameras.py
 #
 # The rig has NO RTSP authentication and speaks plaintext. It is pinned to the
@@ -37,6 +43,12 @@ services:
       - FAKECAM_MODE=${FAKECAM_MODE:-auto}
       # Output fps cap, transcode only (e.g. 10 to keep CPU down).
       - FAKECAM_FPS=${FAKECAM_FPS:-}
+      # folder — a subfolder is one camera playing all its clips in sequence
+      # file   — every file is its own camera, however deep it sits
+      - FAKECAM_GROUP=${FAKECAM_GROUP:-folder}
+      # Seconds between rescans. A new stream needs two scans to agree on its
+      # contents before it goes live, so expect up to 2× this much delay.
+      - FAKECAM_SCAN_INTERVAL=${FAKECAM_SCAN_INTERVAL:-5}
     volumes:
       # NOTE: if this file is missing, Docker silently creates a DIRECTORY in
       # its place and the container dies with exit 127. Keep it in the repo.
