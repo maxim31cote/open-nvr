@@ -2,6 +2,7 @@ import type { ReactNode } from 'react'
 import { clsx } from 'clsx'
 import { Check } from 'lucide-react'
 import { Button, EmptyState, SeverityBadge } from '../ui'
+import { useTranslation } from '../../i18n'
 import { DataTable, type Column } from '../ui/DataTable'
 import { SegmentedControl, type SegmentOption } from '../ui/SegmentedControl'
 import {
@@ -76,6 +77,7 @@ export function AlarmsTable({
   isPending, isFetching, isError, error, onRetry, footer, toolbar,
   fillHeight = true,
 }: AlarmsTableProps) {
+  const { t } = useTranslation()
   const selectable = !!selected && !!onToggle
   const pageIds = rows.map((a) => a.id)
   const allOnPage = selectable && pageIds.every((id) => selected!.has(id))
@@ -130,7 +132,7 @@ export function AlarmsTable({
       ),
     },
     {
-      key: 'severity', header: 'Severity', width: 'w-[92px]',
+      key: 'severity', header: t('alerts.severity'), width: 'w-[92px]',
       cell: (a) => (
         <SeverityBadge
           severity={a.severity}
@@ -142,7 +144,7 @@ export function AlarmsTable({
       // The flexible column — no width, so it takes the slack. Its
       // description truncates because under table-fixed a long one wraps
       // and makes the row taller than its neighbours.
-      key: 'alarm', header: 'Alarm',
+      key: 'alarm', header: t('alerts.alarm'),
       // One line, not two. The description was a second row of 11px text
       // under every title, which doubled the row height to show a
       // sentence that mostly restates the title. Inline and dim, it
@@ -182,7 +184,7 @@ export function AlarmsTable({
       cell: (a) => cameraLabel?.(a.camera_id) ?? (a.camera_id || '—'),
     },
     {
-      key: 'seen', header: 'Date & time', width: 'w-[164px]',
+      key: 'seen', header: t('alerts.dateTime'), width: 'w-[164px]',
       className: 'whitespace-nowrap',
       cellClassName: 'text-[var(--text-dim)] tabular-nums',
       cell: (a) => <span title={alarmSeenTitle(a)}>{alarmSeenAt(a)}</span>,
@@ -230,7 +232,8 @@ export function AlarmsTable({
       isFetching={isFetching}
       isError={isError}
       error={error}
-      errorTitle="Could not load alarms"
+      errorTitle={t('alerts.failedLoad')}
+      errorMessage={t('alerts.tryAgain')}
       onRetry={onRetry}
       empty={<EmptyState title={emptyTitle} description={emptyDescription} action={emptyAction} />}
       footer={footer}
@@ -330,20 +333,23 @@ export function AlarmsFilters({
   onSeverity: (s: string | null) => void
   children?: ReactNode
 }) {
+  const { t } = useTranslation()
+  const severityOptions: SegmentOption<string | null>[] = [{ value: null, label: t('alerts.all') }, ...ALARM_SEVERITIES.map((s) => ({ value: s, label: s[0].toUpperCase() + s.slice(1) }))]
+  const statusOptions: SegmentOption<'all' | 'unacked'>[] = [{ value: 'all', label: t('alerts.all') }, { value: 'unacked', label: t('alerts.unacknowledged'), title: t('alerts.onlyUnacknowledged') }]
   return (
     <>
       <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
         <SegmentedControl
-          label="Status"
+          label={t('alerts.status')}
           showLabel
-          options={STATUS_OPTIONS}
+          options={statusOptions}
           value={onlyUnacked ? 'unacked' : 'all'}
           onChange={(v) => onUnacked(v === 'unacked')}
         />
         <SegmentedControl
-          label="Severity"
+          label={t('alerts.severity')}
           showLabel
-          options={SEVERITY_OPTIONS}
+          options={severityOptions}
           value={severity}
           onChange={onSeverity}
         />
