@@ -87,6 +87,39 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    import os as _os
+    raw = (_os.environ.get(name) or "").strip().lower()
+    if not raw:
+        return default
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw in ("0", "false", "no", "off"):
+        return False
+    log.warning("%s=%r is not a boolean; using %s", name, raw, default)
+    return default
+
+
+def motion_config_from_env() -> "MotionConfig":
+    """#373: the MotionConfig fields, operator-tunable at last. Before
+    this, the worker constructed the motion gate from hardcoded defaults
+    with no env plumbing — a camera whose scene never calibrated could
+    not be tuned or un-gated without a code change. Factored out (and
+    module-level) so tests pin the env-var names to the fields."""
+    return MotionConfig(
+        enabled=_env_bool("DETECT_MOTION_ENABLED", True),
+        threshold=_env_int("DETECT_MOTION_THRESHOLD", 30),
+        contour_area=_env_int("DETECT_MOTION_CONTOUR_AREA", 10),
+        frame_alpha=_env_float("DETECT_MOTION_FRAME_ALPHA", 0.01),
+        lightning_threshold=_env_float(
+            "DETECT_MOTION_LIGHTNING_THRESHOLD", 0.8),
+        calibration_max_frames=_env_int(
+            "DETECT_MOTION_CALIBRATION_MAX_FRAMES", 150),
+        calibration_max_forced_exits=_env_int(
+            "DETECT_MOTION_MAX_FORCED_EXITS", 2),
+    )
+
+
 def _env_labels(name: str, default_csv: str) -> frozenset[str] | None:
     """Parse a comma-separated label allowlist; "all"/"*" → None (no filter)."""
     import os as _os
@@ -307,6 +340,7 @@ class CameraWorker:
         dispatcher=None,                         # Tier-1 dispatch (#10); shared, thread-safe
         router=None,                             # escalation → adapter routing
         visit_poster=None,                       # events store: post finished visits (RFC-0001 C1)
+        attempt_poster=None,                     # multi-frame OCR: early plate attempts (shared)
     ) -> None:
         self.spec = spec
         self.sink = sink
@@ -335,6 +369,7 @@ class CameraWorker:
         self.router = router_for_skills(spec.skills, base=router)
         self._dispatch_once = OncePerTrack()
         self.visit_poster = visit_poster
+        self.attempt_poster = attempt_poster
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         # The live source, so request_stop() can unblock the reader.
@@ -520,13 +555,54 @@ class CameraWorker:
         lifecycle = VisitLifecycle(
             self.spec.camera_id, nvr_camera_id=self.spec.nvr_camera_id
         )
-        motion = MotionDetector((h, w), MotionConfig())
+        # Multi-frame OCR: candidates + early attempts, only on cameras
+        # whose assignments include the LPR skill (everyone else pays
+        # nothing). See platecands.py / plate_attempts.py.
+        lpr_camera = bool(
+            self.spec.skills and "license_plate_recognition" in self.spec.skills
+        )
+        early_attempts = None
+        if lpr_camera and self.attempt_poster is not None:
+            from .plate_attempts import EarlyPlateAttempts
+            early_attempts = EarlyPlateAttempts(
+                self.attempt_poster, self.spec.camera_id,
+                nvr_camera_id=self.spec.nvr_camera_id,
+                max_attempts=_env_int("DETECT_PLATE_EARLY_ATTEMPTS", 2),
+            )
+            log.info("tier0 %s: multi-frame plate OCR active "
+                     "(candidates=%d, early attempts=%d)",
+                     self.spec.camera_id,
+                     _env_int("DETECT_PLATE_CANDIDATES", 4),
+                     _env_int("DETECT_PLATE_EARLY_ATTEMPTS", 2))
+        motion = MotionDetector(
+            (h, w), motion_config_from_env(), label=self.spec.camera_id,
+        )
         tracker = Tracker((h, w), TrackConfig(
             fps=self.spec.fps,
             max_tracks=_env_int("DETECT_MAX_TRACKS", 50),
             coast_ttl_seconds=float(_env_int("DETECT_TRACK_TTL", 300)),
             min_spawn_score=_env_float("DETECT_MIN_SPAWN_SCORE", 0.5),
         ))
+        # Evidence/candidate crop margin, clamped to something sane: 0
+        # is the bare box, 2 is a crop five times the box on each axis.
+        tracker.crop_margin = max(0.0, min(2.0, _env_float(
+            "DETECT_CROP_MARGIN", 0.25)))
+        if lpr_camera:
+            tracker.retain_plate_candidates = True
+            tracker.plate_candidates_max = _env_int("DETECT_PLATE_CANDIDATES", 4)
+            tracker.plate_candidates_gap_s = _env_float(
+                "DETECT_PLATE_CANDIDATE_GAP_S", 0.75)
+        if _env_bool("DETECT_SCENE_EVIDENCE", True):
+            # A second JPEG per visit: the whole frame behind the best crop,
+            # so the evidence dialog can show the car in its lane instead of
+            # a crop of the car. Clamped, not merely parsed — the clamp is
+            # the only thing between a mistyped knob and a payload core
+            # rejects for size (2 MiB); 1920px at q95 is ~600 KB.
+            tracker.retain_scene = True
+            tracker.scene_max_px = max(
+                320, min(_env_int("DETECT_SCENE_MAX_PX", 1280), 1920))
+            tracker.scene_quality = max(
+                40, min(_env_int("DETECT_SCENE_JPEG_QUALITY", 78), 95))
         pipe = DetectPipeline(
             None, motion, self.detector, tracker,
             model_size=(self.model_size, self.model_size),
@@ -642,6 +718,11 @@ class CameraWorker:
                 # and its best frame is final — exactly the moment it becomes
                 # history in the canonical event store. Non-blocking: finished
                 # visits go to the poster's bounded queue.
+                # Multi-frame OCR: early attempts fire while the car is
+                # still in frame — the read no longer waits for the track
+                # to die (which, on a busy road, can take minutes).
+                if early_attempts is not None:
+                    early_attempts.observe(result.tracks)
                 if self.visit_poster is not None:
                     for visit in lifecycle.observe(result.tracks, time.time()):
                         self.visit_poster.submit(visit)
@@ -747,6 +828,7 @@ class WorkerManager:
         dispatcher=None,                                  # Tier-1 dispatch (#10), shared
         router=None,
         visit_poster=None,                                # events store (RFC-0001 C1), shared
+        attempt_poster=None,                              # multi-frame OCR early attempts, shared
     ) -> None:
         self.provider = provider
         self.sink = sink
@@ -792,6 +874,7 @@ class WorkerManager:
         self._dispatcher = dispatcher
         self._router = router
         self._visit_poster = visit_poster
+        self._attempt_poster = attempt_poster
         self._factory = worker_factory or self._default_factory
         self._workers: dict[str, Worker] = {}
         # The spec each running worker was built with — reconcile restarts
@@ -849,6 +932,7 @@ class WorkerManager:
             gate_sink=self._gate_sink,
             dispatcher=self._dispatcher, router=self._router,
             visit_poster=self._visit_poster,
+            attempt_poster=self._attempt_poster,
         )
 
     def running_ids(self) -> set[str]:

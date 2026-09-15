@@ -90,7 +90,56 @@ It reports p50/p95 per phase and quantifies how much background polling
 ## Turn detection & background-noise rejection
 
 A hands-free loop only feels good if it (a) ends the turn when you stop talking
-and (b) doesn't react to room noise. Two layers handle this:
+and (b) doesn't react to room noise.
+
+**Which path you are on matters.** The agent has two voice paths:
+
+* The **demo page's Talk mode** (`/demo`) records an utterance in the
+  browser and POSTs it to `/converse`. Turn-taking there is the browser's
+  own *energy* detector described below — there is no speech model on the
+  client. Smart Turn is **not** in this loop.
+* The **streaming pipeline** (`/ws`, Pipecat 1.8) is where Silero VAD +
+  **Smart Turn v3** live: semantic end-of-turn, and — for clients that opt
+  in — model-backed interruptions (`MinWordsUserTurnStartStrategy`: a reply
+  is only cut when the interrupter has actually said a few words). The demo
+  page does not use `/ws` yet; a client that streams 16 kHz PCM over it
+  gets the semantic behaviour.
+
+So if the demo page "stopped speaking when someone said a couple of random
+words", that was the client barge-in gate (now *firm* by default, see
+below), not Smart Turn.
+
+### Interruptions on the streaming pipeline (`turns.py`)
+
+On `/ws` the question "should the agent yield?" is answered the way a
+person answers it, from four cues the pipeline already has — and only
+while the agent is speaking (when it is silent the first sound of speech
+opens the turn, so Smart Turn's end-of-turn detection is untouched):
+
+| cue | source | rule (config) |
+|---|---|---|
+| it is speech | Silero VAD start/stop pair | a cough or a chair never makes one |
+| it lasts | the pair's span | ≥ `interrupt_min_ms` (300) |
+| it has words | Whisper transcript, backchannels stripped | ≥ `interrupt_min_words` (2); "yeah", "okay", "mm-hm" count for nothing |
+| it is for the agent | `addressed_to_agent()` | its name, a question, a request/correction ("no, wait", "show", "the other"), the site's own words (camera names, gate, plate…) — vs a third-person aside ("he said lunch is at one") or a long narrative with none of those |
+
+A phrase that passes all four interrupts (an `InterruptionFrame`; the
+reply is cut and the phrase becomes the next user turn); anything else is
+dropped from the aggregation and the agent keeps talking. If the agent
+has already gone quiet by the time the transcript lands, the addressee
+test is skipped — nobody was being interrupted. Every decision is logged
+(`interruption accepted/ignored (<reason>): '<text>'`) and kept in
+`GET /interruptions` with the text, duration and reason, which is the
+evidence to tune the three knobs from on your own site. `interruptions:
+eager` restores plain VAD barge-in; `off` lets the agent always finish.
+
+Cost: the decision needs the transcript, so on CPU it lands ~0.2 s (VAD
+stop) + Whisper's time after the interrupter pauses — a *firm* yield, not
+an instant one. What it does not do: read gaze, or know voices — a
+wake-word mode and per-operator voice enrolment are the two stronger
+addressee signals, both possible later on the same gate.
+
+Two layers handle the demo page:
 
 - **Client VAD (browser).** The mic uses `echoCancellation` + `noiseSuppression`
   + `autoGainControl`, then an RMS energy gate that **adapts to the ambient
@@ -98,11 +147,100 @@ and (b) doesn't react to room noise. Two layers handle this:
   `max(floor, noiseFloor × 2.2)`, so steady background noise never crosses it,
   while soft speech still does. Endpointing stops the turn after ~900 ms of
   silence (min 350 ms, max 15 s), and capture is suppressed while the agent is
-  speaking so it never hears itself.
+  speaking so it never hears itself. **Barge-in** (talking over the agent)
+  is a separate gate on the same mic: *firm* (default) stops the reply only
+  after ~550 ms of sustained speech well above the noise floor (short dips
+  tolerated — speech has gaps), so a cough, a word to someone else, or a
+  chair scraping does not; *eager* stops on the first clear syllable (the
+  old ~70 ms rule); *off* always lets the agent finish. Set it under the
+  header ("interrupt when I talk over it"); persisted per browser.
 - **Server STT guard (`stt_noise_filter`, on by default).** Whisper hallucinates
   stock phrases from silence/noise — "Thank you.", "you", "Thanks for watching".
   `looks_like_noise()` drops these so a noisy room can't trigger a phantom turn;
   the UI just keeps listening. Set `stt_noise_filter: false` to disable.
+
+## Turn detection on CPU (Smart Turn v3)
+
+Since Pipecat 1.8 the agent closes a turn with **Smart Turn v3** — a small
+semantic end-of-turn model bundled in the wheel and run on CPU with
+onnxruntime — instead of a silence timer. What it costs, measured on a
+4-core ARM VM with no GPU (`tests/test_turn_hardware.py` covers the sizing;
+the numbers come from `LocalSmartTurnAnalyzerV3._predict_endpoint` on 8 s
+of audio):
+
+| Stage | When it runs | Cost |
+|---|---|---|
+| Silero VAD | every 32 ms audio chunk | ~0.24 ms per chunk (≈0.7 % of one core) |
+| Smart Turn v3 verdict | **once per pause** (VAD stop), not per frame | ~60–90 ms single-threaded |
+| same, BLAS/OMP left uncapped | | 90–130 ms — *slower*, and it takes every core |
+| model load | once per WebSocket conversation | ~50–90 ms |
+
+Two things follow, and the agent does both by itself:
+
+- **Thread caps.** The verdict's feature step is an 8 s Whisper-style log-mel
+  computed in numpy; uncapped, OpenBLAS/OpenMP fans it across every core,
+  which is slower for a 1×8 s input *and* steals cores from Whisper, Piper
+  and Ollama next door. `camera_agent.py` sets
+  `OMP_NUM_THREADS=OPENBLAS_NUM_THREADS=MKL_NUM_THREADS=1` before numpy
+  loads (the Dockerfile sets the same); an explicit value in the environment
+  wins. onnxruntime has its own pool — `turn_cpu_threads` — and **1 thread is
+  the fastest setting up to 7 cores**; auto uses 2 from 8 cores.
+- **Hardware profile.** `turn_detector: auto` (the default) looks at the cores
+  *this process may use* — scheduler affinity **and** a cgroup CPU quota
+  (`docker run --cpus`, compose `cpus:`), which `os.cpu_count()` ignores —
+  and runs Smart Turn whenever there are ≥ 2. On a single core it falls back
+  to a plain silence timer (`turn_timer_secs`, default 0.8 s; no model at
+  all). The startup log prints the resolved choice
+  (`turn-taking: Smart Turn v3 … 1 onnxruntime thread(s) … 4 core(s)`), and
+  `GET /hardware` returns it under `turn`.
+
+Knobs (`config.yml`):
+
+```yaml
+turn_detector: auto      # auto | smart | timer
+# turn_cpu_threads: 1    # onnxruntime threads per verdict (auto: 1, 2 from 8 cores)
+# turn_timer_secs: 0.8   # timer mode: silence that ends a turn
+turn_max_secs: 8.0       # the model only ever sees the last 8 s; more is pure cost
+turn_stop_secs: 2.0      # after this much silence the turn ends regardless
+```
+
+Memory is negligible (the model is ~8 MB; a 16 kHz int16 buffer for
+`turn_max_secs` is 256 KB). The one thing worth knowing on a busy box: the
+verdict runs on the pipeline's event loop thread pool, so a 60–90 ms pause
+verdict is the floor of the "you stop → agent starts" latency; the Whisper
+transcript for the turn is usually still in flight at that point, so it
+rarely adds to the wall clock.
+
+## Thinking aloud (`fillers.py`)
+
+A person who has to look something up says what they are about to do,
+then goes quiet and does it. The agent knows *what it is about to do* the
+moment the first LLM pass returns a tool call — the tool and its
+arguments — and that is the only moment worth filling: the tool, the
+second LLM pass and TTS are the slow part. So when a voice question needs
+a slow tool it says, from the call's own arguments, "Let me check the
+gate camera for vehicles between 2 and 3" / "Let me take a look at the
+front door camera — is the door open" / "Let me check the plate reads for
+6 6 H H 0 7 in the last hour", and the line plays while the tool runs.
+
+What it costs: no LLM (one sentence shape per tool, slots filled from the
+arguments the model already extracted), one short Piper synthesis run in
+parallel with the tool and cached by text, one message on the page's
+`/updates` socket. Nothing is added to the answer's path; the answer cuts
+the line if it lands first. On a CPU-only box Piper is the CPU hog, so
+the parallel synthesis is the one real cost — cached lines are free, and
+typed questions never synthesise (status text only).
+
+When it speaks: at most once per turn, never for instant lookups or
+control verbs (`recent_events`, `create_alarm`…), and only when the
+expected wait — the agent's own recent medians for that tool + the second
+LLM pass + TTS, seeded from defaults — is at least `filler_min_ms`
+(1500). On a GPU box where a history search plus reply takes a second,
+it stays quiet. `GET /thinking-aloud` lists the recent decisions with
+their reasons. `filler_source: model` asks the LLM to write the line in
+the *same* first pass (about ten extra output tokens) and falls back to
+the template when the model's line is missing, long, or is the answer
+itself — worth trying with your model; the template is the safe default.
 
 ## Recommended model choices
 

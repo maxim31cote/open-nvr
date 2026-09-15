@@ -40,7 +40,6 @@ Env:
   DETECT_DECODE_IDLE        adaptive decode while quiet (default nokey; none = off)
   DETECT_DECODE_IDLE_AFTER  quiet seconds before idling (default 60)
   DETECT_HWACCEL_DEVICE     e.g. /dev/dri/renderD128
-  DETECT_MODEL_SIZE         detector input square (default 320)
   DETECT_REFRESH_SECONDS    camera-list reconcile interval (default 30)
 """
 from __future__ import annotations
@@ -492,10 +491,17 @@ def build_manager(cfg: ServiceConfig, sink, *, gate_sink=None) -> WorkerManager:
     # Events store (RFC-0001 C1): post finished visits + best-frame evidence
     # to core. Best-effort by design — core down loses history, not detection.
     visit_poster = None
+    attempt_poster = None
     if cfg.visits_enabled and cfg.core_url:
         from .events_poster import VisitPoster
         visit_poster = VisitPoster(cfg.core_url, cfg.api_key)
         visit_poster.start()
+        # Multi-frame OCR: early plate attempts ride their own bounded
+        # queue to core's attempt endpoint. Same lifecycle as visits —
+        # no core_url, no attempts.
+        from .plate_attempts import AttemptPoster
+        attempt_poster = AttemptPoster(cfg.core_url, cfg.api_key)
+        attempt_poster.start()
     manager = WorkerManager(
         provider, sink,
         enabled=cfg.enabled,
@@ -519,6 +525,7 @@ def build_manager(cfg: ServiceConfig, sink, *, gate_sink=None) -> WorkerManager:
         dispatcher=dispatcher,
         router=router,
         visit_poster=visit_poster,
+        attempt_poster=attempt_poster,
     )
     manager.best_frames = best_frames            # expose so main() can serve it
     # Same reason: main() wires this into /health. It is a LOCAL of this

@@ -100,6 +100,15 @@ The map lives in KAI-C beside the publisher, is part of this contract
 What already flows, now with names. Payload field tables list required
 fields; producers may add optional ones under the additive-only rule.
 
+Every v1 payload below is also a class in the App SDK
+(`opennvr_app_sdk.event_types`: `DetectionObserved`, `VisitRecorded`,
+`PlateRecognized`, `AccessDecided`, `OccupancyChanged`,
+`OccupancyHeatmap`, `OccupancyFootfall`). `event.typed()` on a
+`DomainEvent` parses the payload — required fields enforced, additive
+fields kept in `.extra`, off-contract payloads returned as `None` and
+logged — and `DomainEventPublisher.publish_typed(...)` writes one. The
+tables here remain normative; the classes follow them.
+
 ### `detection.observed.v1`
 
 Subject: `opennvr.events.detection.observed.v1.<camera_id>`
@@ -117,7 +126,29 @@ consumers.
 |---|---|---|
 | `frame` | object | `{w, h}` in pixels — lets consumers normalise boxes. |
 | `calibrating` | bool | Tier-0 still calibrating; treat tracks as provisional. |
-| `tracks` | array | Same track shape as `opennvr.tier0.v1` (`id`, `label`, `conf`, `bbox`, motion fields). Normative source: `detect_pipeline/bus.py::build_payload`. |
+| `tracks` | array | Same track shape as `opennvr.tier0.v1` (`id`, `label`, `conf`, `bbox`, motion fields). Normative source: `detect_pipeline/bus.py::build_payload`. Each track also carries `matched` (bool): true when the object was detected in *this* frame, false when the track is **coasting** — kept alive at its last box (up to `coast_ttl_seconds`) because the tracker did not see it leave. Also `misses` (int): consecutive frames the detector looked for this track and did not find it — stays 0 while a **stationary** track is skipped on purpose (re-verified every Nth frame). And `since_match_s` (float): seconds since the last positive match, 0 on the frame it was matched. Tier-0 re-verifies tracks on a per-frame region budget, so a present object is matched every few frames, not every frame. A live renderer should hide a track with `misses > 0` and otherwise draw it while `since_match_s` is recent (core uses 3 s); consumers reasoning about presence (visits, occupancy) want every track. Additive: absent means matched / 0. |
+
+### `overlay.boxes.v1`
+
+Subject: `opennvr.events.overlay.boxes.v1.<camera_id>`
+Producer: any app (SDK `OverlayBoxes` / `DomainEventPublisher.publish_overlay`).
+
+Boxes an app wants drawn over the operator's live video — plate
+localisations, zones, anything with a rectangle. Core forwards them to
+the browser (`/events/ws`, `task=overlay`) **only for apps the operator
+has switched on in the App Catalog** (`installed_apps.overlay_enabled`,
+off by default); otherwise the event is published and ignored, so an
+app may call `publish_overlay` unconditionally. Whether a given screen
+draws them is that viewer's own toggle. Core never draws an app's
+boxes for a camera the viewer may not watch.
+
+`payload`:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `boxes` | array | Required. `{label, box: [x, y, w, h], score?, id?}`; `box` normalized to 0..1 of the frame. |
+| `frame` | `{w, h}` \| absent | Optional. If `box` is in pixels, ship the frame size and core normalizes. Pixel boxes without it are dropped. |
+| `seq` | int \| absent | Optional producer sequence. |
 
 ### `visit.recorded.v1`
 
@@ -155,6 +186,22 @@ empty/failed reads do not fire).
 | `confidence` | number \| null | Adapter-reported confidence for the read, when available. |
 | `vehicle_label` | string \| null | Upstream detection label (`car`/`truck`/`bus`) when the chain knows it. |
 | `event_id` | int \| null | Timeline visit row this read enriches, when initiated from a visit. |
+| `plate_box` | `[x1,y1,x2,y2]` \| absent | Optional. Where the adapter localised the plate, in the pixel space of the crop it was given. KAI-C does not publish a read whose box abuts the crop edge (a **partial** read), whose localiser scored below `KAI_C_PLATE_MIN_DETECTION_CONFIDENCE` (default 0.6), or whose localiser looked and found no plate (`KAI_C_PLATE_REQUIRE_LOCALISATION`, default on) — so every subscriber sees the same gate. The box is still forwarded for consumers with stricter policies. Consumers may use it to reject **partial** reads: a crop whose edge cuts through the plate still OCRs the surviving characters at high confidence, so `confidence` cannot distinguish `K884` (a fragment of `K884RS`) from a whole plate — only the geometry can. Absent when the adapter reports no localisation. |
+| `plate_box_confidence` | number \| absent | Optional. How sure the adapter's localiser was that it had found a plate at all — distinct from `confidence`, which scores the characters. Consumers reject **false localisations** with it: a manufacturer badge reads as plausible characters (the Audi four rings OCR as `C00D`) at plausible read confidence, from a box in the middle of the crop, so neither `confidence` nor `plate_box` can catch it — but the localiser scored it 0.38 where genuine plates score 0.85+. Absent from OCR-only adapters and from producers that predate the field (consumers then have no opinion to apply). |
+| `observed_at` | string \| absent | Optional. ISO-8601 UTC capture time of the **look this read came off** — when the plate was seen, as distinct from when anything processed it. Supplied by the initiator and echoed verbatim (KAI-C never mints one: it has no knowledge of the initiating system's clocks). This is the authoritative observation time for a read; see the note under the table on why the envelope's `ts` is not. Consumers that display or export a read MUST prefer it, falling back only for producers that predate it. Absent when the initiator did not know the capture time — e.g. a read taken from a stored evidence frame rather than a timestamped candidate look. |
+| `plate_box_image` | `[width,height]` \| absent | Optional. The size of the image `plate_box` is measured in — exactly the bytes the adapter OCR'd. Multi-frame OCR sends plate *candidate* crops whose size differs from the visit's evidence frame, so a consumer judging the box against the evidence file would measure in the wrong image; when this field is present it is the only correct denominator. Absent from adapters that predate it (consumers then fall back to the evidence file's size, correct for single-evidence producers). |
+
+> **`observed_at` vs the envelope's `ts`.** The envelope contract above
+> defines `ts` as the wall-clock time of the *observation*. For
+> `plate.recognized.v1` the current implementation does not meet that:
+> `kai_c/domain_events.py::_envelope` stamps `ts` at publish, so it
+> trails the observation by however long OCR and queueing took — a lag
+> that grows with backlog and is therefore worst exactly when a gate is
+> busiest. Rather than redefine `ts` for every producer mid-flight, the
+> observation time is carried explicitly in `observed_at`, which is
+> additive and unambiguous. Treat `ts` as "when this was published" for
+> this schema, and `observed_at` as "when it happened". Consumers that
+> date a read by `ts` are measuring our pipeline, not the world.
 
 #### Producer convergence (Phase 0 exit criterion)
 
@@ -243,6 +290,57 @@ samples (90-day retention).
 | `level` | string | The committed alerting band: `normal`, `over`, `under`. Additive: consumers must tolerate new bands. |
 | `max_occupancy` | int \| null | The zone's configured ceiling at publish time (charts scale against it). |
 | `min_occupancy` | int \| null | The configured floor, when set. |
+
+### `occupancy.heatmap.v1`
+
+Subject: `opennvr.events.occupancy.heatmap.v1.<camera_id>`
+Producer: `app:occupancy-counting` (or any app binning where watched
+entities stand — consumers must not branch on the producer).
+
+A sparse DELTA of a per-camera heat grid: every watched detection's
+foot point (bottom-centre of its normalised box) binned into a fixed
+`cols × rows` grid in unit space, accrued since the previous publish
+and shipped on a fixed cadence (the reference app: every 60 s, only
+for cameras whose grid is non-empty). Core sums deltas into one row
+per camera-hour (90-day retention) and serves any window from them
+(`GET /api/v1/occupancy/heatmap?camera_id=&hours=`), which the
+Occupancy page paints over a still of the camera.
+
+`payload`:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `cols`, `rows` | int | Grid shape. Unit space, row-major, top-left first; resolution-independent. A consumer keeps one shape per camera-hour and drops deltas of another shape. |
+| `cells` | `[[index, hits], …]` | Sparse: only cells hit since the last publish, `index = row * cols + col`. Hits are per detection per frame. |
+| `frames` | int | Detection frames that contributed to this delta — lets a reader normalise to hits-per-frame. |
+| `period_seconds` | int | The producer's publish cadence, for readers estimating coverage. |
+| `labels` | list[string] | The watched labels binned (`person`, `car`, …). Additive. |
+
+### `occupancy.footfall.v1`
+
+Subject: `opennvr.events.occupancy.footfall.v1.<camera_id>`
+Producer: `app:occupancy-counting` (or any app tracking visitors —
+consumers must not branch on the producer).
+
+A DELTA of per-visitor facts since the previous publish, on the same
+cadence as the heatmap and only when non-empty: crossings of the
+camera's entry line (a→b is an entry, b→a an exit) and finished stays
+inside the zone (dwell — from the frame a track first sat inside the
+zone to the frame it left, or to its track expiring). Core sums deltas
+into one row per camera-hour (90-day retention) and serves
+`GET /api/v1/occupancy/footfall?hours=` — hourly buckets and totals —
+behind the Occupancy page's flow chart and stay figures.
+
+`payload`:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `entries`, `exits` | int | Entry-line crossings in each direction this period. 0 when the camera has no entry line. |
+| `dwell_count` | int | Stays that FINISHED this period (stays under 1 s are edge flicker and not counted). |
+| `dwell_seconds` | number | Their summed duration — `dwell_seconds / dwell_count` is the period's average stay. |
+| `dwell_max_seconds` | number | The longest stay finished this period. |
+| `period_seconds` | int | The producer's publish cadence. |
+| `labels` | list[string] | The watched labels tracked. Additive. |
 
 ## Out of contract (deliberately)
 

@@ -21,15 +21,18 @@ import { DeviceBlockedOverlay } from '../components/DeviceBlockedOverlay'
 import { Menu, Monitor, Camera, Car, Users, Settings as SettingsIcon, Bell, Maximize, Minimize, LogOut, User as UserIcon, Sun, Moon, MonitorPlay, RefreshCcw, FileSearch, Brain, FileCheck, AlertTriangle, Plug, LifeBuoy, KeyRound, Shield, Network, Cpu, Boxes, Cloud, Database, ChevronDown, Layers } from 'lucide-react'
 import { useQuery } from '@tanstack/react-query'
 import { apiService } from '../lib/apiService'
-import { Fragment, useEffect, useMemo, useRef, useState } from 'react'
+import { Fragment, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { useFullscreen } from '../hooks/useFullscreen'
 import { useClickOutside } from '../hooks/useClickOutside'
 import { useAuth } from '../auth/AuthContext'
 import { useTheme } from '../hooks/useTheme'
 import { usePermissions, NAV_PERMISSIONS } from '../hooks/usePermissions'
+import { APP_VERTICALS, manifestProvides } from '../lib/appVerticals'
 import { ErrorBoundary } from '../components/ErrorBoundary'
 import { CameraStatusProvider } from '../hooks/useCameraStatus'
 import { SystemAlertBanner } from '../components/SystemAlertBanner'
+import { AlertBell } from '../components/AlertBell'
+import { useTranslation } from '../i18n'
 
 type NavItem = {
   to: string
@@ -46,6 +49,11 @@ type NavGroup = {
   label: string
   /** pinned groups render their items directly — no header, never collapsible */
   pinned?: boolean
+  /** flat groups scroll with the rest of the menu but render as bare
+   *  links — no header, nothing to expand. For a destination that is one
+   *  page, not a section: a collapsible header hiding a single item is
+   *  a click for nothing. */
+  flat?: boolean
   items: NavItem[]
 }
 
@@ -71,7 +79,6 @@ const NAV_GROUPS: NavGroup[] = [
       { to: '/byom', label: 'AI Models (BYOM)', icon: <Boxes size={16} />, perm: '/byom' },
       { to: '/ai-detection-results', label: 'Detection Results', icon: <Database size={16} />, perm: '/byom' },
       { to: '/ai-adapters', label: 'AI Adapters', icon: <Layers size={16} />, perm: '/ai-engine' },
-      { to: '/app-catalog', label: 'App Catalog', icon: <Boxes size={16} />, perm: '/ai-engine' },
     ],
   },
   {
@@ -107,6 +114,17 @@ const NAV_GROUPS: NavGroup[] = [
   },
 ]
 
+const NAV_LABEL_KEYS: Record<string, string> = {
+  Dashboard: 'nav.dashboard', 'Live View': 'nav.liveView', Recordings: 'nav.recordings', Cameras: 'nav.cameras',
+  'AI & Detections': 'nav.aiDetections', 'AI Engine': 'nav.aiEngine', 'AI Models (BYOM)': 'nav.aiModels',
+  'Detection Results': 'nav.detectionResults', 'AI Adapters': 'nav.aiAdapters', 'Security & Network': 'nav.securityNetwork',
+  Network: 'nav.network', 'Logs & Forensics': 'nav.logsForensics', Governance: 'nav.governance', 'Audit Logs': 'nav.auditLogs',
+  'Compliance & Reports': 'nav.complianceReports', 'Alerts & Incidents': 'nav.alertsIncidents', 'Access Control (RBAC)': 'nav.accessControl',
+  'Customer Keys (BYOK)': 'nav.customerKeys', Administration: 'nav.administration', Configuration: 'nav.configuration',
+  'Media Server Config': 'nav.mediaServerConfig', Integrations: 'nav.integrations', Cloud: 'nav.cloud', Firmware: 'nav.firmware',
+  Support: 'nav.support', Applications: 'nav.applications', 'App Catalog': 'nav.appCatalog',
+}
+
 // Accordion: at most one group is open at a time; its key is persisted.
 const OPEN_GROUP_KEY = 'opennvr.sidebar.openGroup'
 
@@ -119,6 +137,7 @@ function loadOpenGroup(): string | null {
 }
 
 export function AppShell() {
+  const { language, setLanguage, t } = useTranslation()
   const rootRef = useRef<HTMLDivElement>(null)
   const { isFullscreen, toggle } = useFullscreen(rootRef as React.RefObject<HTMLDivElement>)
   const [sidebarOpen, setSidebarOpen] = useState(true)
@@ -158,41 +177,73 @@ export function AppShell() {
     refetchInterval: 120_000,
   })
   // The curated first-class pages, capability-keyed on manifest
-  // `provides` (with a legacy predicate for manifests that predate the
-  // field). Adding a vertical = one row here + its page — the nav
-  // scales with what THIS install enabled, never with catalog size.
+  // `provides` from the shared APP_VERTICALS table (with its legacy
+  // predicate for manifests that predate the field). The catalog reads
+  // that same table to tell an operator where a freshly enabled app will
+  // show up — one row, so the promise and the menu cannot disagree.
+  // Adding a vertical = one row there + its page.
   const apps = appsNav.data ?? []
-  const providesEnabled = (capability: string, legacy?: (m: any) => boolean) =>
-    apps.some((a) => a.enabled && (
-      (a.manifest?.provides ?? []).includes(capability) ||
-      (legacy ? legacy(a.manifest ?? {}) : false)
-    ))
-  const lprEnabled = providesEnabled('vehicles',
-    (m) => (m.requires_tasks ?? []).includes('license_plate_recognition'))
-  const occupancyEnabled = providesEnabled('occupancy')
+  const enabledVerticals = APP_VERTICALS.filter((v) =>
+    apps.some((a) => a.enabled && manifestProvides(a.manifest, v))
+  )
+  // Icons live here (the nav owns its own presentation), keyed by route.
+  const verticalIcon: Record<string, ReactNode> = {
+    '/vehicles': <Car size={16} />,
+    '/occupancy': <Users size={16} />,
+  }
+  const enabledRoutes = enabledVerticals.map((v) => v.to).join(',')
 
   const visibleGroups = useMemo(
     () => {
       const groups = NAV_GROUPS.map((g) => ({ ...g, items: g.items.filter((i) => canView(i.perm)) })).filter((g) => g.items.length > 0)
-      const appItems = [
-        ...(lprEnabled && canView('/vehicles')
-          ? [{ to: '/vehicles', label: 'Vehicles', icon: <Car size={16} />, perm: '/vehicles' as const }]
-          : []),
-        ...(occupancyEnabled && canView('/occupancy')
-          ? [{ to: '/occupancy', label: 'Occupancy', icon: <Users size={16} />, perm: '/occupancy' as const }]
-          : []),
-      ]
+      const appItems = enabledVerticals
+        // `v.to in NAV_PERMISSIONS` first: a vertical added to the table
+        // without its permission row would otherwise ask canView about an
+        // unknown path and get an undefined requirement — fail closed.
+        .filter((v) => v.to in NAV_PERMISSIONS && canView(v.to as keyof typeof NAV_PERMISSIONS))
+        .map((v) => ({
+          to: v.to,
+          label: v.label,
+          icon: verticalIcon[v.to] ?? <Boxes size={16} />,
+          perm: v.to as keyof typeof NAV_PERMISSIONS,
+        }))
+      // Right after the pinned NVR group (i.e. under Cameras): these are
+      // operational pages, not settings.
+      let at = 1
       if (appItems.length > 0) {
-        // Right after the pinned NVR group: these are operational pages.
-        groups.splice(1, 0, { key: 'applications', label: 'Applications', items: appItems })
+        groups.splice(at, 0, { key: 'applications', label: 'Applications', items: appItems })
+        at += 1
+      }
+      // App Catalog sits with the apps, not under "AI & Detections" —
+      // plenty of apps are not AI at all (the notifier, the barrier, the
+      // agent), and the catalog is where the pages above come FROM. Flat
+      // and directly below Applications, so it stays one click even when
+      // no app is installed yet — which is exactly when someone needs to
+      // find it.
+      const catalog: NavItem = {
+        to: '/app-catalog', label: 'App Catalog',
+        icon: <Boxes size={16} />, perm: '/app-catalog',
+      }
+      if (canView(catalog.perm)) {
+        groups.splice(at, 0, {
+          key: 'app-catalog', label: 'App Catalog', flat: true, items: [catalog],
+        })
       }
       return groups
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [hasPermission, lprEnabled, occupancyEnabled]
+    [hasPermission, enabledRoutes]
   )
   const pinnedGroups = visibleGroups.filter((g) => g.pinned)
   const menuGroups = visibleGroups.filter((g) => !g.pinned)
+  // Sticky headers dock at `index * 32`, but a flat group contributes no
+  // header — counting it would leave a 32px hole in the stack and push
+  // every header below it out of place. Offsets count headers, not groups.
+  const headerSlot = useMemo(() => {
+    let n = 0
+    return menuGroups.map((g) => (g.flat ? -1 : n++))
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [visibleGroups])
 
   const activeGroupKey = useMemo(() => {
     for (const g of NAV_GROUPS) {
@@ -242,20 +293,33 @@ export function AppShell() {
           <img src="/opennvr-logo.svg" alt="OpenNVR" className="h-10" />
         </Link>
         <div className="ml-auto flex items-center gap-3">
+          <AlertBell />
+          <label className="inline-flex items-center gap-1 text-xs normal-case tracking-normal text-[var(--text-dim)]">
+            <span className="sr-only">{t('language.label')}</span>
+            <select
+              value={language}
+              onChange={(event) => setLanguage(event.target.value as typeof language)}
+              aria-label={t('language.label')}
+              className="bg-[var(--panel)] text-[var(--text)] border border-[var(--border)] rounded px-1.5 py-1"
+            >
+              <option value="en">{t('language.english')}</option>
+              <option value="fr">{t('language.french')}</option>
+            </select>
+          </label>
           <button
-            aria-label="Toggle Theme"
+            aria-label={t('header.toggleTheme')}
             className="inline-flex items-center gap-1 px-2 py-1 bg-[var(--panel)] hover:bg-[var(--panel-2)] rounded"
             onClick={toggleTheme}
-            title={theme === 'light' ? 'Switch to dark' : 'Switch to light'}
+            title={theme === 'light' ? t('header.switchToDark') : t('header.switchToLight')}
           >
             {theme === 'light' ? <Moon size={14} /> : <Sun size={14} />}
-            <span className="hidden md:inline">{theme === 'light' ? 'Dark' : 'Light'}</span>
+            <span className="hidden md:inline">{theme === 'light' ? t('header.switchToDark') : t('header.switchToLight')}</span>
           </button>
           {canView('/live') && (
             <Link
               to="/live"
               className="inline-flex items-center gap-1 px-2 py-1 bg-[var(--panel)] hover:bg-[var(--panel-2)] rounded"
-              title="Open Live View"
+              title={t('header.openLiveView')}
             >
               <Camera size={14} />
               <span className="hidden md:inline">Live</span>
@@ -265,28 +329,28 @@ export function AppShell() {
             <button
               className="inline-flex items-center gap-1 px-2 py-1 bg-[var(--panel)] hover:bg-[var(--panel-2)] rounded"
               onClick={() => setMenuOpen((s) => !s)}
-              title={user ? user.username : 'Account'}
+              title={user ? user.username : t('header.account')}
             >
               <UserIcon size={14} />
-              <span className="hidden md:inline">{user?.username ?? 'Account'}</span>
+              <span className="hidden md:inline">{user?.username ?? t('header.account')}</span>
             </button>
             {menuOpen && (
               <div className="absolute right-0 mt-1 bg-[var(--panel)] border border-[var(--border)] text-sm min-w-40 z-50">
-                <div className="px-3 py-2 text-[var(--text-dim)]">Signed in as <span className="text-[var(--text)]">{user?.username}</span></div>
+                <div className="px-3 py-2 text-[var(--text-dim)]">{t('header.signedInAs')} <span className="text-[var(--text)]">{user?.username}</span></div>
                 <button className="w-full text-left px-3 py-2 hover:bg-[var(--panel-2)] inline-flex items-center gap-2" onClick={logout}>
-                  <LogOut size={14} /> Logout
+                  <LogOut size={14} /> {t('header.logout')}
                 </button>
               </div>
             )}
           </div>
           <button
-            aria-label="Toggle Fullscreen"
+            aria-label={t('header.toggleFullscreen')}
             className="inline-flex items-center gap-1 px-2 py-1 bg-[var(--panel)] hover:bg-[var(--panel-2)] rounded"
             onClick={toggle}
-            title={isFullscreen ? 'Exit Fullscreen' : 'Enter Fullscreen'}
+            title={isFullscreen ? t('header.exitFullscreen') : t('header.enterFullscreen')}
           >
             {isFullscreen ? <Minimize size={14} /> : <Maximize size={14} />}
-            <span className="hidden md:inline">Fullscreen</span>
+            <span className="hidden md:inline">{isFullscreen ? t('header.exitFullscreen') : t('header.enterFullscreen')}</span>
           </button>
           <LiveClock />
         </div>
@@ -301,15 +365,15 @@ export function AppShell() {
             <button
               className="inline-flex items-center justify-center p-2 text-[var(--text-dim)] hover:text-[var(--text)] hover:bg-[var(--panel-2)] rounded"
               onClick={() => setSidebarOpen((s) => !s)}
-              aria-label="Toggle Sidebar"
-              title={sidebarOpen ? 'Collapse sidebar' : 'Expand sidebar'}
+              aria-label={t('sidebar.toggle')}
+              title={sidebarOpen ? t('sidebar.collapse') : t('sidebar.expand')}
             >
               <Menu size={16} />
             </button>
             {pinnedGroups.map((group) => (
               <div key={group.key} className="mt-2 space-y-0.5">
                 {group.items.map((item) => (
-                  <SideLink key={item.to} to={item.to} end={item.end} label={item.label} icon={item.icon} collapsed={!sidebarOpen} />
+                  <SideLink key={item.to} to={item.to} end={item.end} label={t(NAV_LABEL_KEYS[item.label] ?? item.label)} icon={item.icon} collapsed={!sidebarOpen} />
                 ))}
               </div>
             ))}
@@ -323,7 +387,18 @@ export function AppShell() {
                 return (
                   <div key={group.key} className="mb-2 pb-2 border-b border-[var(--border)] last:border-b-0 space-y-0.5">
                     {group.items.map((item) => (
-                      <SideLink key={item.to} to={item.to} end={item.end} label={item.label} icon={item.icon} collapsed />
+                      <SideLink key={item.to} to={item.to} end={item.end} label={t(NAV_LABEL_KEYS[item.label] ?? item.label)} icon={item.icon} collapsed />
+                    ))}
+                  </div>
+                )
+              }
+              // Flat: a single destination, so no header and nothing to
+              // collapse — it just sits in the list as a link.
+              if (group.flat) {
+                return (
+                  <div key={group.key} className="py-1 space-y-0.5">
+                    {group.items.map((item) => (
+                      <SideLink key={item.to} to={item.to} end={item.end} label={t(NAV_LABEL_KEYS[item.label] ?? item.label)} icon={item.icon} />
                     ))}
                   </div>
                 )
@@ -335,18 +410,18 @@ export function AppShell() {
               return (
                 <Fragment key={group.key}>
                   <button
-                    style={{ top: gi * 32 }}
+                    style={{ top: headerSlot[gi] * 32 }}
                     className="sticky z-10 w-full h-8 flex items-center justify-between px-2.5 text-sm font-medium bg-[var(--bg-2)] text-[var(--text-dim)] hover:text-[var(--text)] hover:bg-[var(--panel-2)] rounded"
                     onClick={() => toggleGroup(group.key)}
                     aria-expanded={!collapsed}
                   >
-                    <span className="truncate whitespace-nowrap">{group.label}</span>
+                    <span className="truncate whitespace-nowrap">{t(NAV_LABEL_KEYS[group.label] ?? group.label)}</span>
                     <ChevronDown size={16} className={`flex-shrink-0 transition-transform ${collapsed ? '-rotate-90' : ''}`} />
                   </button>
                   {!collapsed && (
                     <div className="pl-3 py-1 space-y-0.5">
                       {group.items.map((item) => (
-                        <SideLink key={item.to} to={item.to} end={item.end} label={item.label} icon={item.icon} />
+                        <SideLink key={item.to} to={item.to} end={item.end} label={t(NAV_LABEL_KEYS[item.label] ?? item.label)} icon={item.icon} />
                       ))}
                     </div>
                   )}

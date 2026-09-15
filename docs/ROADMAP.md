@@ -272,6 +272,41 @@ to a release window. Pull requests and design discussions are welcome.
 - **Edge co-processor integration.** Coral / TensorRT / Hailo adapter
   variants beyond the ONNX-only adapters that ship in v0.1.
 - **Native Kubernetes operator** for Helm-chart deployments at scale.
+- **App Catalog for developers** (see `docs/DEVELOPER_PROGRAM.md`):
+  catalog policy decided — installable apps are open source under the
+  `open-nvr` organisation, built from source by CI, with author, contact
+  and declared network egress on the card; closed software lists as
+  external; paid = open code that gates a licensed model or service.
+  Shipped: maintainer-verified badge, Featured row, provenance line,
+  validator rules, the org's `build-catalog-app` reusable workflow
+  (any `open-nvr/app-*` repository builds, signs and publishes its image
+  from source by calling it), `opennvr-app new --repo` (CI, publish
+  workflow and listing entry scaffolded), `make pin-apps-index`. Shipped:
+  signed catalog images (Sigstore keyless in the publish workflow) verified by the
+  installer before any pinned install; per-app NATS credentials (the `nats-apps`
+  leaf bus; user = app id, permissions from the manifest;
+  `requires_scopes` enforced on the bus), per-app call tokens (no site
+  key reaches an app), and enforced egress (apps on an internal
+  network; the egress proxy allows declared + operator-allowed hosts,
+  refusals in the inbox — `docs/APP_NETWORK.md`). Still open: install
+  counts (opt-in, aggregate) and a showcase page. SDK toward 1.0
+  (on main, unreleased until QA signs off 0.5.0): `opennvr_app_sdk.testing`
+  (recorder, event builders, `feed`, `FakeCore`, pytest fixtures), the
+  v1 domain events as typed classes, `opennvr-app validate`, async
+  `ai.stream()`.
+- **Commercial direction** (decided Sep 2026): sovereign / NDAA-restricted
+  enterprise deployments with support and compliance packs first
+  (shipped: `docs/ENTERPRISE.md`, `docs/REFERENCE_APPLIANCE.md`,
+  `scripts/evidence_pack.py`); OpenNVR Models designed
+  (`docs/design/models-service.md`) with the adapter side shipped in
+  the ai-adapter repository (signed licensed bundles, yolov8 as the
+  reference);
+  OpenNVR Models (per-site fine-tuning, delivered as licensed adapters
+  through the catalog) second; a paid partner tier (certification,
+  hosted licence service, lead routing — paid by the vendor, never a
+  cut of sales) once real third-party apps exist; cloud add-on and
+  hardware later. The platform and the SDK stay free; nothing in the
+  catalog is gated.
 
 ## How to influence the roadmap
 
@@ -298,6 +333,12 @@ Discussion and a migration path will ship alongside.
    events. The federated-AI roadmap item (v0.3) is opt-in by design and
    will land with the same posture.
 4. **Honest CHANGELOG.** Breaking changes get a major-version bump.
+5. **The app-registry contract is versioned and tested.** What an SDK
+   app reads from `POST /apps/register`, `/config` and `/status` does
+   not change shape without an `api_version` bump, and `min_sdk_version`
+   only moves when an old SDK would misbehave —
+   `docs/DEVELOPER_PROGRAM.md` § *The compatibility promise*, pinned by
+   `server/tests/test_registry_contract.py`.
    We're 0.x — bumps are cheaper here than at 1.x — but the policy
    stays the same when we cross 1.0.
 

@@ -51,13 +51,16 @@ from models import (
 from routers import (
     ai_detection_results,
     ai_model_management,
+    adapters_catalog,
     ai_models,
+    alerts_inbox,
     apps,
     audit_logs,
     auth,
     camera_config,
     camera_settings,
     cameras,
+    app_platform,
     internal_camera_agent,
     timeline_events,
     cloud as cloud_router,
@@ -96,7 +99,7 @@ from services.mediamtx_admin_service import MediaMtxAdminService as _MtxAdmin
 # The OpenNVR release this build is cut from. Surfaced in /health and in the
 # OpenAPI schema, and quoted in bug reports (see SECURITY.md) — so it tracks the
 # git tag, not the API shape. Bump it in the release commit.
-__version__ = "0.1.4"
+__version__ = "0.1.5"
 
 # FFmpeg-based RTSP proxy and recorder removed
 
@@ -117,7 +120,8 @@ async def lifespan(app: FastAPI):
         posture = current_posture()
         main_logger.info(
             f"Boot policy: deployment_mode={posture['deployment_mode']} "
-            f"ai_sovereignty={posture['ai_sovereignty']}"
+            f"ai_sovereignty={posture['ai_sovereignty']} "
+            f"detection_overlay={'on' if settings.detection_overlay_enabled else 'OFF'}"
         )
         audit_boot_posture()
         # Warn loudly if the retired ALLOW_REMOTE_MEDIAMTX env var is still set
@@ -212,11 +216,16 @@ async def lifespan(app: FastAPI):
             # apps.install); the full seed above only runs on an empty table.
             try:
                 from models import Permission as _Permission2
+                from services.apps_view_backfill import backfill_apps_view
 
                 for _pname, _pdesc in (
                     (
                         "apps.install",
                         "Install/uninstall curated App Store apps",
+                    ),
+                    (
+                        "apps.view",
+                        "Browse the App Catalog and view installed apps",
                     ),
                 ):
                     if (
@@ -230,10 +239,33 @@ async def lifespan(app: FastAPI):
                         main_logger.info(
                             "Seeded new permission %r (upgrade path)", _pname
                         )
+                        # apps.view took the App Catalog off ai.view.
+                        # Creating the row alone would REVOKE the catalog
+                        # from everyone who could open it yesterday, so
+                        # backfill it to whoever holds ai.view — but ONLY
+                        # on the boot that creates it. Doing it every boot
+                        # would undo a deliberate revoke.
+                        if _pname == "apps.view":
+                            _granted = backfill_apps_view(db)
+                            main_logger.info(
+                                "Granted apps.view to %d role(s) holding "
+                                "ai.view", _granted
+                            )
             except Exception:
                 main_logger.warning(
                     "Upgrade-path permission seeding failed", exc_info=True
                 )
+
+            # Apps bus: (re)render the per-app NATS users file so the
+            # nats-apps leaf server knows every app that holds a key —
+            # a fresh volume, a restored DB or a crash mid-write all
+            # converge here. No-op when NATS_USERS_CONF is unset.
+            try:
+                from services.nats_users import write_users_conf
+
+                write_users_conf(db)
+            except Exception:
+                main_logger.warning("apps-bus users file not written", exc_info=True)
 
             # If any user still needs first-time setup, arm a one-time token and
             # print it to stdout; it gates /auth/first-time-setup so nobody can
@@ -379,7 +411,16 @@ async def lifespan(app: FastAPI):
     # Start background provisioning task
     import asyncio
 
-    asyncio.create_task(background_mediamtx_provisioning())
+    # Fire-and-forget tasks MUST go through spawn_background: a bare
+    # asyncio.create_task() whose return value is dropped is only weakly
+    # referenced by the loop, and the GC really does destroy such tasks
+    # mid-flight (field incident: the alerts-inbox consumer was killed
+    # one second after subscribing — "coroutine ignored GeneratorExit" —
+    # and the site lost its alarm chain until the next restart).
+    from core.background_tasks import run_consumer_forever, spawn_background
+
+    spawn_background(background_mediamtx_provisioning(),
+                     name="mediamtx-provisioning")
 
     # Start retention cleanup scheduler
     async def background_retention_cleanup():
@@ -409,7 +450,8 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             main_logger.error(f"Retention cleanup scheduler failed: {e}", exc_info=True)
 
-    asyncio.create_task(background_retention_cleanup())
+    spawn_background(background_retention_cleanup(),
+                     name="retention-cleanup")
 
     # Disk-pressure loop: a near-full disk cannot wait for the daily sweep —
     # MediaMTX simply fails to write once space runs out. Every 5 minutes:
@@ -453,7 +495,7 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             main_logger.error(f"Disk pressure scheduler failed: {e}", exc_info=True)
 
-    asyncio.create_task(background_disk_pressure())
+    spawn_background(background_disk_pressure(), name="disk-pressure")
 
     # Host resource monitor: CPU/RAM/disk sampling + edge-triggered alerts
     # (system_events + live bus). 15s cadence; work runs in a worker thread.
@@ -477,7 +519,7 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             main_logger.error(f"System monitor scheduler failed: {e}", exc_info=True)
 
-    asyncio.create_task(background_system_monitor())
+    spawn_background(background_system_monitor(), name="system-monitor")
 
     # Recording-health watchdog: surfaces "camera silently stopped recording"
     # as a camera event within minutes instead of being discovered days later.
@@ -512,7 +554,33 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             main_logger.error(f"Recording watchdog scheduler failed: {e}", exc_info=True)
 
-    asyncio.create_task(background_recording_watchdog())
+    spawn_background(background_recording_watchdog(),
+                     name="recording-watchdog")
+
+    # Apps-bus link watchdog: the apps bus is a leaf of the platform bus
+    # and every app alert crosses that one link. When it is down both
+    # servers look healthy and alerts just stop — so core checks
+    # nats-apps' /leafz itself and raises an inbox alert if the link is
+    # gone for more than a couple of minutes.
+    async def background_apps_bus_watch():
+        try:
+            from services import apps_bus_watch
+
+            url = apps_bus_watch.monitor_url(settings.nats_apps_url,
+                                             settings.nats_apps_monitor_url)
+            if not url:
+                return
+            await asyncio.sleep(30)  # let nats-apps come up and dial the leaf
+            while True:
+                try:
+                    await asyncio.to_thread(apps_bus_watch.check_once, url)
+                except Exception as e:
+                    main_logger.error(f"Apps-bus watch failed: {e}", exc_info=True)
+                await asyncio.sleep(apps_bus_watch.CHECK_INTERVAL_S)
+        except Exception as e:
+            main_logger.error(f"Apps-bus watch scheduler failed: {e}", exc_info=True)
+
+    spawn_background(background_apps_bus_watch(), name="apps-bus-watch")
 
     # Recordings-index reconciler: startup backfill of the recordings table
     # from the on-disk archive, then a periodic recent-window convergence
@@ -526,33 +594,65 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             main_logger.error(f"Recording reconciler failed: {e}", exc_info=True)
 
-    asyncio.create_task(background_recording_reconciler())
+    spawn_background(background_recording_reconciler(),
+                     name="recording-reconciler")
 
     # RFC-0002 Phase 0: consume plate.recognized.v1 from the bus and write
     # plate_text onto timeline rows — producer-independent (EVENT_CONTRACTS.md
     # convergence). No NATS_URL / no nats-py degrades to the enrichment
     # fallback's synchronous writes; the loop itself never raises.
     async def background_plate_event_consumer():
-        try:
+        async def _loop():
             from services.plate_event_consumer import run_consumer_loop
 
             await run_consumer_loop()
-        except Exception as e:
-            main_logger.error(f"Plate event consumer failed: {e}", exc_info=True)
 
-    asyncio.create_task(background_plate_event_consumer())
+        await run_consumer_forever("Plate event consumer", _loop)
+
+    spawn_background(background_plate_event_consumer(),
+                     name="plate-event-consumer")
 
     # Occupancy history: consume occupancy.changed.v1 samples into the
     # history store (EVENT_CONTRACTS.md). Same best-effort posture.
     async def background_occupancy_event_consumer():
-        try:
+        async def _loop():
             from services.occupancy_event_consumer import run_consumer_loop
 
             await run_consumer_loop()
-        except Exception as e:
-            main_logger.error(f"Occupancy consumer failed: {e}", exc_info=True)
 
-    asyncio.create_task(background_occupancy_event_consumer())
+        await run_consumer_forever("Occupancy consumer", _loop)
+
+    spawn_background(background_occupancy_event_consumer(),
+                     name="occupancy-event-consumer")
+
+    # Live detection overlay: bridge Tier-0 tracks (NATS) onto the
+    # in-process bus so /events/ws can stream normalized boxes to the
+    # browser. Same best-effort posture: no bus → no overlay, never a
+    # failed boot.
+    async def background_tier0_track_consumer():
+        async def _loop():
+            from services.tier0_track_consumer import run_consumer_loop
+
+            await run_consumer_loop()
+
+        await run_consumer_forever("Tier-0 track consumer", _loop)
+
+    spawn_background(background_tier0_track_consumer(),
+                     name="tier0-track-consumer")
+
+    # Operator alert inbox: consume opennvr.alerts.> (the SDK apps'
+    # NatsAlertChannel) into app_alerts so the UI bell can ring and
+    # acknowledge. Same best-effort posture — no bus, no inbox, no crash.
+    async def background_alerts_inbox_consumer():
+        async def _loop():
+            from services.alerts_inbox import run_consumer_loop
+
+            await run_consumer_loop()
+
+        await run_consumer_forever("Alerts inbox consumer", _loop)
+
+    spawn_background(background_alerts_inbox_consumer(),
+                     name="alerts-inbox-consumer")
 
     # Start camera connectivity reconciler — safety net for the MediaMTX
     # runOnReady/runOnNotReady hooks (catches missed hooks and restarts of
@@ -734,7 +834,11 @@ app.include_router(users.router, prefix=settings.api_prefix)
 app.include_router(cameras.router, prefix=settings.api_prefix)
 app.include_router(camera_settings.router, prefix=settings.api_prefix)
 app.include_router(internal_camera_agent.router, prefix=settings.api_prefix)
+# The app platform door (snapshot, recordings, plates, alerts, state) —
+# app-key scoped; see routers/app_platform.py and docs/APP_PLATFORM.md.
+app.include_router(app_platform.router, prefix=settings.api_prefix)
 app.include_router(timeline_events.router, prefix=settings.api_prefix)
+app.include_router(alerts_inbox.router, prefix=settings.api_prefix)
 app.include_router(streams.router, prefix=settings.api_prefix)
 app.include_router(camera_config.router, prefix=settings.api_prefix)
 app.include_router(roles.router, prefix=settings.api_prefix)
@@ -761,6 +865,9 @@ app.include_router(cloud_router.router, prefix=settings.api_prefix)
 app.include_router(cloud_streaming.router, prefix=settings.api_prefix)
 app.include_router(firmware_router.router, prefix=settings.api_prefix)
 app.include_router(ai_models.router, prefix=settings.api_prefix)
+# The AI adapter catalog — which models a deployment can install
+# (server/config/adapters_index.yml, docs/CONTRIBUTING_ADAPTERS.md).
+app.include_router(adapters_catalog.router, prefix=settings.api_prefix)
 app.include_router(ai_model_management.router, prefix=settings.api_prefix)
 app.include_router(ai_detection_results.router, prefix=settings.api_prefix)
 app.include_router(apps.router, prefix=settings.api_prefix)

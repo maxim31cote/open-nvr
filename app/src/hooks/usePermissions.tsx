@@ -135,9 +135,13 @@ export const NAV_PERMISSIONS = {
   '/updates': 'firmware.view',
   '/logs': 'audit.view',
   '/ai-engine': 'ai.view',
+  // Browsing the catalog is its own right: most apps are not AI, and
+  // looking is far weaker than apps.install, which still gates install.
+  '/app-catalog': 'apps.view',
   '/byom': 'byom.manage',
   '/compliance': 'compliance.view',
   '/alerts-incidents': 'alerts.view',
+  '/alarms': 'alerts.view',
   '/integrations': 'integrations.view',
   '/onvif-tools': 'onvif.discover',
   '/cloud': 'cloud.view',

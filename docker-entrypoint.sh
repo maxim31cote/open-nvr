@@ -16,6 +16,25 @@ if [ -d "/app/keys" ]; then
     chown -R opennvr:opennvr /app/keys 2>/dev/null || true
 fi
 
+# KAI-C adapter-registration state volume (#371) — first mount is
+# root-owned; KAI-C (running as opennvr under supervisord) must be able
+# to write its receipts file there or persistence silently degrades to
+# the old restart-amnesia behaviour (it WARNs, but still).
+if [ -d "/app/kai-c-state" ]; then
+    chown -R opennvr:opennvr /app/kai-c-state 2>/dev/null || true
+fi
+
+# Apps-bus users file (opennvr_nats_auth volume, shared with nats-apps).
+# nats-apps runs as root and creates the directory root:root 755 when it
+# seeds users.conf, so core (uid opennvr) could never replace the seed
+# with the real per-app users: every app's own NATS user stayed unknown
+# to the bus and it refused them all ("authentication error - User
+# <app>"). Core writes atomically (tempfile + rename in this directory),
+# so it needs to own the directory, not just the file.
+if [ -d "/var/lib/opennvr/nats" ]; then
+    chown -R opennvr:opennvr /var/lib/opennvr/nats 2>/dev/null || true
+fi
+
 # Recordings tree: MediaMTX used to run as root, so segment dirs it created
 # under the shared mount were root-owned — unlinkable by the backend
 # (uid 1000), which broke retention aging and the camera hard-delete purge

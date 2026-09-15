@@ -35,6 +35,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    text,
 )
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
@@ -252,11 +253,13 @@ class Camera(Base):
     # A list of {"skill": "<capability>", "labels": [..]?} entries, e.g.
     # [{"skill": "license_plate_recognition"},
     #  {"skill": "object_detection", "labels": ["person", "truck"]}].
-    # Written ONLY by the camera settings surface; served additively on the
-    # internal camera-agent endpoint so consumers (Tier-0 reconcile, the
-    # App SDK's cameras_for_skill, the catalog UI) can opt in one by one.
-    # NULL/[] = nothing assigned — every consumer must treat that as
-    # "no restriction declared", never as "do nothing" (back-compat).
+    # Written by the camera settings surface and by an app adopting a
+    # camera in its own config; served on the internal camera-agent
+    # endpoint to Tier-0 reconcile, the App SDK's cameras_for_skill and
+    # the catalog UI.
+    # NULL/[] = nothing assigned. That camera is ELIGIBLE for every
+    # skill's picker and ADOPTED by none: it keeps streaming, recording
+    # and Tier-0 detection, and no app inference runs on it.
     # Nullable so the additive column self-heal can add it to old
     # create_all databases.
     assignments = Column(JSON, nullable=True)
@@ -485,6 +488,15 @@ class TimelineEvent(Base):
     __tablename__ = "events"
     __table_args__ = (
         Index("ix_events_cam_start", "camera_id", "started_at"),
+        # The plate aggregations range over WHEN A READ HAPPENED, which is
+        # coalesce(observed_at, started_at) (services.timeline_service.
+        # SEEN_AT). That expression cannot use the index above — the planner
+        # matched camera_id and then filtered the range against every row the
+        # camera ever recorded, and this table holds every track, people
+        # included. Mirrors ix_events_cam_start so the same queries seek the
+        # same way (#451).
+        Index("ix_events_cam_seen", "camera_id",
+              text("coalesce(observed_at, started_at)")),
         # One visit = one (camera, track, start): ingest retries are
         # idempotent. NULLs (alarm/alert rows) never collide by SQL semantics.
         Index("uq_events_visit", "camera_id", "track_id", "started_at",
@@ -503,6 +515,53 @@ class TimelineEvent(Base):
     recording_ref = Column(String(500), nullable=True)
     evidence_path = Column(String(500), nullable=True)
     plate_text = Column(String(32), nullable=True)
+    # The crop the plate was actually READ from (#382). Multi-frame OCR
+    # reads plate-candidate crops, not the visit's vehicle-best frame —
+    # the two are anti-correlated by construction (a car is biggest when
+    # closest, which is when its plate leaves the crop), so showing
+    # evidence_path beside plate_text shows a photo that often does not
+    # contain the plate. NULL for rows read from the evidence crop
+    # itself, and for every row enriched before this column existed:
+    # readers fall back to evidence_path.
+    plate_evidence_path = Column(String(500), nullable=True)
+    # The WHOLE camera frame the best crop was taken from. evidence_path is
+    # framed for the SUBJECT — detection box plus a quarter-box margin —
+    # which is precisely what stops it answering "where was this, what else
+    # was in shot, was the gate open". Widening that crop would ruin the one
+    # thing it is good at, so the scene is a second content-addressed JPEG
+    # instead. NULL for rows written before this column and for pipelines
+    # running with DETECT_SCENE_EVIDENCE off; readers fall back to
+    # evidence_path.
+    scene_evidence_path = Column(String(500), nullable=True)
+    # The UNCROPPED attempt plate_evidence_path was cut out of: a crop of
+    # the vehicle, at the moment its plate was read. Needed because a
+    # visit is not always one vehicle — track association merges a
+    # departing car with the one arriving behind it, and the visit's
+    # best-thumbnail frame is then a DIFFERENT car from the one the
+    # plate came off. This image is the only one on the row that is
+    # guaranteed to show the car the number belongs to.
+    plate_frame_path = Column(String(500), nullable=True)
+    # When the plate was SEEN — the capture time of the frame the winning
+    # read came from, as opposed to when any part of the platform got
+    # round to processing it.
+    #
+    # started_at cannot answer this. It is the visit's start, and a visit
+    # is not always one vehicle: track association merges a departing car
+    # with the one arriving behind it, so on a merged track started_at is
+    # the moment a DIFFERENT car arrived — the same defect that makes
+    # plate_frame_path the only trustworthy image on the row. This column
+    # is that image's timestamp, so the picture and the time agree.
+    #
+    # Why it is not a processing time: OCR latency varies with backlog and
+    # track length, so a processing stamp is wrong by an amount that grows
+    # exactly when the gate is busiest; it does not scrub to the right
+    # second of recording; and re-running the enrichment sweep would
+    # restamp history as "now". This value is stable under reprocessing.
+    #
+    # NULL for non-plate rows, for rows read from the evidence frame
+    # (no candidate stamp to inherit), and for every row written before
+    # this column existed: readers fall back to started_at.
+    observed_at = Column(DateTime(timezone=True), nullable=True)
     payload = Column(JSON, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
@@ -749,6 +808,56 @@ class SecuritySetting(Base):
     json_value = Column(Text, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+
+
+class AppAlert(Base):
+    """Operator-facing alert inbox (§11.5 app-emitted alerts).
+
+    Apps publish alerts onto ``opennvr.alerts.>`` (the SDK's
+    NatsAlertChannel); until this table nothing consumed them — alerts
+    reached stdout and the bus and stopped there, so "alarm on unknown
+    vehicle" fired into a log nobody watches. One row per fired alert;
+    the UI polls unacknowledged rows, rings per severity, and writes the
+    acknowledgement back here so every open browser stops ringing at
+    once.
+
+    ``camera_id`` is the wire HANDLE (``cam3``) exactly as the producer
+    sent it — alerts must survive producers the core doesn't know
+    (adapters, future kai-c policy alerts), so no FK.
+    """
+
+    __tablename__ = "app_alerts"
+    __table_args__ = (
+        Index("ix_app_alerts_unacked", "acknowledged_at", "fired_at"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    # Producer-assigned id — the dedup key for at-least-once delivery.
+    alert_id = Column(String(64), unique=True, nullable=False, index=True)
+    fired_at = Column(DateTime(timezone=True), nullable=False)
+    severity = Column(String(16), nullable=False)   # low|medium|high|critical
+    title = Column(String(200), nullable=False)
+    description = Column(Text, nullable=True)
+    source_kind = Column(String(30), nullable=True)     # app|adapter|kai-c
+    source_name = Column(String(100), nullable=True, index=True)
+    camera_id = Column(String(60), nullable=True, index=True)
+    correlation_id = Column(String(64), nullable=True)
+    evidence = Column(Text, nullable=True)              # JSON, as received
+    tags = Column(Text, nullable=True)                  # JSON list
+    # When the thing the alert is ABOUT was seen, as opposed to fired_at,
+    # which is when the app got round to deciding. Producers that know it
+    # send it in the alert's evidence; NULL for everyone else, and
+    # readers fall back to fired_at.
+    #
+    # fired_at stays the sort key. An inbox ordered by observed time is
+    # not append-only — a read that took longer to OCR would insert its
+    # alarm ABOVE ones already on the guard's screen, where it is
+    # scrolled past rather than seen. So: order by arrival, display when
+    # it happened.
+    observed_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    acknowledged_at = Column(DateTime(timezone=True), nullable=True)
+    acknowledged_by = Column(Integer, ForeignKey("users.id"), nullable=True)
 
 
 class AuditLog(Base):
@@ -1022,11 +1131,67 @@ class InstalledApp(Base):
     manifest_json = Column(JSON, nullable=False)
     config_json = Column(JSON, nullable=False, default=dict)
     enabled = Column(Boolean, default=False, nullable=False)
+    # Operator opt-in: may this app's overlay.boxes.v1 events be drawn
+    # over the live video? Off by default — an app drawing on the
+    # operator's screen is a privilege the operator grants, per app.
+    overlay_enabled = Column(Boolean, default=False, nullable=False, server_default="0")
     # registered | ok | unreachable
     status = Column(String(20), nullable=False, default="registered")
     last_seen = Column(DateTime(timezone=True), nullable=True)
+    # The app's OWN credential (services/app_keys.py): SHA-256 of the
+    # ``oak_…`` key minted at registration and handed back exactly once.
+    # NULL = no key issued (a pre-credential registration, or revoked).
+    # With it the app reads only its own config/status and its own
+    # camera roster; the deployment's INTERNAL_API_KEY stays for
+    # platform components (detect-pipeline, KAI-C, the agent).
+    api_key_hash = Column(String(64), nullable=True, index=True)
+    api_key_issued_at = Column(DateTime(timezone=True), nullable=True)
+    # The SDK version the app last registered with — decides whether core
+    # may still forward the site key on the action / entitlement calls
+    # (SDK < 0.6 gates them on it) or signs them per app instead.
+    sdk_version = Column(String(32), nullable=True)
+    # bcrypt of the app key, for the apps bus (nats-apps): the app joins
+    # NATS as user=<app id>, password=<its key>; core renders this into
+    # the bus's users file (services/nats_users.py). Cleared on revoke.
+    nats_password_bcrypt = Column(String(80), nullable=True)
+    # Hosts the operator allowed this install to reach through the egress
+    # proxy, on top of what its catalog listing declared
+    # (services/app_egress.py). A JSON list of host rules.
+    egress_allow = Column(JSON, nullable=True)
+    # Licensed apps (manifest ``entitlement: license_key``): the key the
+    # administrator entered, Fernet-encrypted at rest and never returned;
+    # and the app's own verdict on it (services/app_entitlements.py).
+    # status: none | unverified | valid | invalid.
+    license_key_encrypted = Column(Text, nullable=True)
+    entitlement_status = Column(String(16), nullable=False, default="none",
+                                server_default="none")
+    entitlement_plan = Column(String(100), nullable=True)
+    entitlement_expires_at = Column(DateTime(timezone=True), nullable=True)
+    entitlement_message = Column(String(500), nullable=True)
+    entitlement_limits = Column(JSON, nullable=True)
+    entitlement_checked_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+
+
+class AppState(Base):
+    """Durable per-app key/value state (the SDK's ``client.state``).
+
+    Apps kept everything in memory (``KeyedState``) or invented a SQLite
+    file each; a restart forgot the register, the cooldowns, the last
+    seen plate. One small table, namespaced by app id, readable and
+    writable only with that app's key (or the site key naming the app):
+    a JSON value per key, last-write-wins.
+    """
+
+    __tablename__ = "app_state"
+
+    app_id = Column(String(100), ForeignKey("installed_apps.id", ondelete="CASCADE"),
+                    primary_key=True)
+    key = Column(String(200), primary_key=True)
+    value = Column(JSON, nullable=False)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(),
+                        onupdate=func.now())
 
 
 class AppInstallIntent(Base):
@@ -1095,3 +1260,53 @@ class OccupancySample(Base):
     # (additive — future producers may add bands).
     level = Column(String(16), nullable=False, default="normal")
     ts = Column(DateTime(timezone=True), nullable=False, index=True)
+
+
+class OccupancyHeatmap(Base):
+    """One camera-hour of the spatial heatmap (``occupancy.heatmap.v1``).
+
+    The occupancy app bins every watched detection's FOOT point into a
+    fixed unit-space grid and ships sparse deltas every minute or so;
+    the consumer sums them into the row for that camera and hour. The
+    Occupancy page sums rows over any window (last hour, today, 7 days)
+    and paints the grid over a still of the camera. ``cells`` is a flat
+    ``cols * rows`` list of ints, row-major, top-left first — small
+    enough (48x27 = 1296 ints) that JSON beats a bytes column for
+    dialect portability. Retention: pruned with the samples (90 days).
+    """
+
+    __tablename__ = "occupancy_heatmaps"
+
+    id = Column(Integer, primary_key=True, index=True)
+    camera_id = Column(Integer, nullable=False, index=True)
+    # The hour bucket the deltas fell in (UTC, minute/second zeroed).
+    hour_start = Column(DateTime(timezone=True), nullable=False, index=True)
+    cols = Column(Integer, nullable=False)
+    rows = Column(Integer, nullable=False)
+    cells = Column(JSON, nullable=False)
+    # Frames that contributed — lets the page normalise "hits per frame"
+    # so a busy hour and a quiet hour paint on the same scale.
+    frames = Column(Integer, nullable=False, default=0)
+    updated_at = Column(DateTime(timezone=True), nullable=False)
+
+
+class OccupancyFootfall(Base):
+    """One camera-hour of footfall and dwell (``occupancy.footfall.v1``).
+
+    Entries/exits are crossings of the camera's entry line (a→b in,
+    b→a out); dwell is per finished stay inside the zone. Deltas are
+    summed into the row for that camera and hour, like the heatmap;
+    the page reads any window as sums and averages. Pruned with the
+    samples (90 days)."""
+
+    __tablename__ = "occupancy_footfall"
+
+    id = Column(Integer, primary_key=True, index=True)
+    camera_id = Column(Integer, nullable=False, index=True)
+    hour_start = Column(DateTime(timezone=True), nullable=False, index=True)
+    entries = Column(Integer, nullable=False, default=0)
+    exits = Column(Integer, nullable=False, default=0)
+    dwell_count = Column(Integer, nullable=False, default=0)
+    dwell_seconds = Column(Float, nullable=False, default=0.0)
+    dwell_max_seconds = Column(Float, nullable=False, default=0.0)
+    updated_at = Column(DateTime(timezone=True), nullable=False)

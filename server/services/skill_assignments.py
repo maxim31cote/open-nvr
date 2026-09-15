@@ -192,10 +192,16 @@ def set_operator_assignments(
 
 def skill_view(db: Session, skill: str) -> dict[str, Any]:
     """``GET /api/v1/skills/{id}/cameras``: the skill's union, with the
-    per-consumer claims visible so a release is never a surprise."""
+    per-consumer claims visible so a release is never a surprise.
+
+    Live cameras only (#372) — the operator view must show the same
+    union the consumers act on, or a binned camera's stale claim looks
+    like a working assignment."""
     rows = (
         db.query(SkillAssignment)
-        .filter(SkillAssignment.skill == (skill or "").strip())
+        .join(Camera, Camera.id == SkillAssignment.camera_id)
+        .filter(SkillAssignment.skill == (skill or "").strip(),
+                Camera.deleted_at.is_(None))
         .order_by(SkillAssignment.camera_id, SkillAssignment.consumer)
         .all()
     )
@@ -215,11 +221,113 @@ def skill_view(db: Session, skill: str) -> dict[str, Any]:
     }
 
 
+def release_camera_claims(db: Session, camera_id: int) -> int:
+    """Camera deletion cleanup (#372): drop every skill claim on the
+    camera, returning how many rows went. Called by BOTH delete paths —
+    soft delete (the bin) and hard delete (the purge; also prevents the
+    FK from failing the camera row delete). No commit here: the caller
+    owns the transaction, so the cleanup lands atomically with the
+    tombstone/purge it belongs to.
+
+    The query-side ``deleted_at`` filter above already makes stale rows
+    inert, so this is hygiene + belt: rows from installs deleted before
+    this fix are handled by the filter (and swept by migration
+    ff77bb88cc99) even if this cleanup never ran for them."""
+    removed = (
+        db.query(SkillAssignment)
+        .filter(SkillAssignment.camera_id == camera_id)
+        .delete(synchronize_session=False)
+    )
+    if removed:
+        logger.info(
+            "released %d skill claim(s) for deleted camera %s",
+            removed, camera_id,
+        )
+    return removed
+
+
 def assignments_by_skill(db: Session) -> dict[str, list[int]]:
     """skill -> sorted union of camera ids. The registry's Phase 2
     source: an empty list never appears (no rows = no key), so
-    ``skill not in map`` IS 'dormant' for the status derivation."""
+    ``skill not in map`` IS 'dormant' for the status derivation.
+
+    Only LIVE cameras count (issue #372). Camera deletion is a soft
+    delete, and a stale assignment row pointing at a binned camera used
+    to keep the restriction ARMED while scoping consumers to a camera
+    that no longer exists — the LPR app would ignore every live camera
+    because one deleted one still 'claimed' the skill. The join also
+    drops orphan rows whose camera was hard-deleted. When the last live
+    assignment goes, the key disappears and the restriction correctly
+    lifts (CAMERA_ASSIGNMENTS.md: 'the assignment list for that skill
+    is the whole truth' — the truth must not include tombstones)."""
     out: dict[str, set[int]] = {}
-    for row in db.query(SkillAssignment).all():
+    rows = (
+        db.query(SkillAssignment)
+        .join(Camera, Camera.id == SkillAssignment.camera_id)
+        .filter(Camera.deleted_at.is_(None))
+        .all()
+    )
+    for row in rows:
         out.setdefault(row.skill, set()).add(row.camera_id)
     return {k: sorted(v) for k, v in out.items()}
+
+
+# ── The eligibility rule, in one place ──────────────────────────────
+#
+# Two different questions get asked about a camera and a skill, and
+# conflating them is what made assignments advisory:
+#
+#   ELIGIBLE — may this skill be offered this camera? Open by default:
+#     a camera nobody has claimed can be picked by anyone. This is what
+#     a configuration picker asks.
+#   ADOPTED  — is this camera actually claimed by that skill? This is
+#     what COMPUTE asks, and it is never true by default. An unassigned
+#     camera is eligible everywhere and computes nowhere.
+#
+# Both read the denormalised ``Camera.assignments`` projection rather
+# than the claim table, because the hot path (plate ingest) already has
+# the camera row in hand and must not pay a second query per visit.
+
+
+def camera_skills(camera) -> set[str]:
+    """Skills claimed on a camera, from the JSON projection.
+
+    The projection is NULL when nothing is claimed and a list of
+    ``{"skill": ..., "labels"?: [...]}`` otherwise (see
+    :func:`project_camera`). Malformed entries are ignored rather than
+    raised on: this is read on the ingest path, and a bad row in the
+    column must not cost a visit.
+    """
+    entries = getattr(camera, "assignments", None)
+    if not isinstance(entries, list):
+        return set()
+    out: set[str] = set()
+    for entry in entries:
+        if isinstance(entry, dict):
+            skill = entry.get("skill")
+            if isinstance(skill, str) and skill.strip():
+                out.add(skill.strip().lower())
+    return out
+
+
+def camera_adopted(camera, skill: str) -> bool:
+    """Does this camera actually carry that skill? The COMPUTE gate.
+
+    False for an unassigned camera — that is the point. Inference for a
+    skill runs on the cameras an operator pointed it at, not on every
+    camera that happens to exist.
+    """
+    return skill.strip().lower() in camera_skills(camera)
+
+
+def camera_eligible(camera, skill: str) -> bool:
+    """May this skill be OFFERED this camera? The picker gate.
+
+    Open by default: a camera with no claims at all is fair game for
+    every skill, which is what "nothing assigned = no restriction
+    declared" has always meant in the editor. Once a camera declares
+    anything, that declaration is exhaustive — a camera assigned to
+    object detection stops appearing in the LPR picker.
+    """
+    claimed = camera_skills(camera)
+    return not claimed or skill.strip().lower() in claimed

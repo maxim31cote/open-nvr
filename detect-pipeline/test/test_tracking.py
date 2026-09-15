@@ -3,6 +3,8 @@
 """Unit tests for the lean size-aware tracker."""
 from __future__ import annotations
 
+from pathlib import Path
+
 from detect_pipeline.tracking import (
     Detection,
     Track,
@@ -128,6 +130,25 @@ def test_best_crop_includes_context_around_the_box():
         f"expected a quarter-box margin per side, got {w}x{h}")
 
 
+def test_crop_margin_is_a_tracker_setting_applied_to_both_crops():
+    """DETECT_CROP_MARGIN: a wider margin keeps the whole car in the read
+    frame when the detector's box trails a moving one (the LPR dialog
+    showed an Audi with its left side cut off). One setting, both crops
+    — the visit's evidence and the plate candidates come from the same
+    helper, so they cannot drift apart."""
+    import numpy as np
+    from detect_pipeline.tracking import _crop_bgr
+
+    frame = np.zeros((1080, 1920, 3), np.uint8)
+    crop = _crop_bgr(frame, (800, 400, 1000, 700), margin=0.5)
+    h, w = crop.shape[:2]
+    assert (w, h) == (200 + 2 * 100, 300 + 2 * 150), f"got {w}x{h}"
+    src = (Path(__file__).resolve().parents[1] / "detect_pipeline"
+           / "tracking.py").read_text()
+    assert src.count("margin=self.crop_margin") == 2, (
+        "both _crop_bgr call sites must use the tracker's crop_margin")
+
+
 def test_best_crop_margin_clamps_at_the_frame_edge():
     """A box in a corner cannot borrow context that does not exist — the crop
     clamps to the frame instead of failing or wrapping."""
@@ -152,3 +173,169 @@ def test_best_crop_of_a_full_frame_box_is_the_frame():
     frame = np.zeros((480, 640, 3), np.uint8)
     crop = _crop_bgr(frame, (0, 0, 640, 480))
     assert crop.shape[:2] == (480, 640)
+
+
+# ── scene evidence ──────────────────────────────────────────────────
+#
+# The scene is the WHOLE frame behind best_crop, encoded eagerly at
+# best-frame update time. "Eagerly" is the entire design: retaining the
+# BGR pixels instead would be 6.2 MB x DETECT_MAX_TRACKS per camera, so
+# these tests pin the memory and CPU invariants, not just the happy path.
+
+
+def _frame(h=480, w=640):
+    import numpy as np
+    return np.zeros((h, w, 3), np.uint8)
+
+
+def _scene_tracker(monkeypatch, encode=None, **kw):
+    """Tracker with scene retention on and a counting fake encoder."""
+    import detect_pipeline.bestframe as bf
+    calls = {"n": 0}
+
+    def enc(bgr, *, max_px=1280, quality=78):
+        calls["n"] += 1
+        if encode is not None:
+            return encode(bgr)
+        return b"SCENEJPEG"
+
+    monkeypatch.setattr(bf, "encode_scene_jpeg", enc)
+    tk = Tracker(FRAME, _cfg(**kw))
+    tk.retain_scene = True
+    return tk, calls
+
+
+def test_scene_is_encoded_once_per_frame_however_many_tracks_peak(monkeypatch):
+    """Fifty tracks peaking on one frame must cost ONE imencode, not fifty —
+    and must SHARE the bytes, not hold fifty copies of the same image."""
+    tk, calls = _scene_tracker(monkeypatch)
+    dets = [
+        Detection("person", (x, 100, x + 60, 300), 0.8)
+        for x in (100, 220, 340, 460, 580)
+    ]
+    tracks = tk.update(dets, _frame())
+    assert len(tracks) == 5
+    assert calls["n"] == 1, f"encoded {calls['n']} times for one frame"
+    first = tracks[0].best_scene_jpeg
+    assert first is not None
+    assert all(t.best_scene_jpeg is first for t in tracks), "bytes not shared"
+
+
+def test_scene_frame_is_not_retained_between_updates(monkeypatch):
+    """The memo holds a reference to a 6 MB array; if update() leaked it, a
+    24/7 camera would keep one frame alive forever for nothing."""
+    tk, _calls = _scene_tracker(monkeypatch)
+    tk.update([Detection("person", (100, 100, 160, 300), 0.8)], _frame())
+    assert tk._scene_bgr is None
+    assert tk._scene_jpeg is None and tk._scene_done is False
+
+
+def test_scene_only_moves_when_the_best_crop_does(monkeypatch):
+    """The two images must describe the SAME frame. A later frame that loses
+    is_better_thumbnail updates neither — and costs no encode."""
+    tk, calls = _scene_tracker(monkeypatch)
+    big = Detection("person", (100, 100, 300, 600), 0.9)
+    tk.update([big], _frame())
+    assert calls["n"] == 1
+    kept = tk.tracks[0].best_scene_jpeg
+    # Same track, smaller + lower score: not a better thumbnail.
+    tk.update([Detection("person", (105, 105, 200, 400), 0.6)], _frame())
+    assert tk.tracks[0].best_scene_jpeg is kept
+    assert calls["n"] == 1, "encoded for a frame that was not the best"
+
+
+def test_scene_retention_is_off_by_default():
+    """Every existing caller and test pays one boolean, never an encode."""
+    tk = Tracker(FRAME, _cfg())
+    tk.update([Detection("person", (100, 100, 160, 300), 0.8)], _frame())
+    tr = tk.tracks[0]
+    assert tr.best_crop is not None                 # crop still retained
+    assert tr.best_scene_jpeg is None
+
+
+def test_a_failed_scene_encode_costs_one_attempt_and_never_the_crop(monkeypatch):
+    """A bad frame must not cost the visit its evidence photo, and must not
+    be retried once per track — the failure itself is memoised."""
+    def boom(_bgr):
+        raise RuntimeError("cv2 said no")
+
+    tk, calls = _scene_tracker(monkeypatch, encode=boom)
+    dets = [
+        Detection("person", (x, 100, x + 60, 300), 0.8)
+        for x in (100, 220, 340)
+    ]
+    tracks = tk.update(dets, _frame())
+    assert all(t.best_crop is not None for t in tracks)
+    assert all(t.best_scene_jpeg is None for t in tracks)
+    assert calls["n"] == 1, "a failed encode was retried per track"
+
+
+def test_plate_candidates_stay_box_sized_with_scene_retention_on(monkeypatch):
+    """The scene must never reach the OCR ring: a whole-frame candidate is a
+    plate a few pixels tall, which would quietly wreck LPR recall."""
+    tk, _calls = _scene_tracker(monkeypatch)
+    tk.retain_plate_candidates = True
+    frame = _frame(1080, 1920)
+    tk.update([Detection("car", (800, 400, 1000, 700), 0.9)], frame)
+    ring = tk.tracks[0].plate_ring
+    assert ring is not None
+    for cand in ring.ranked():
+        assert cand.crop.shape[:2] != frame.shape[:2], "candidate is the whole frame"
+
+
+# ─── matched_now: detected this frame vs coasting ───────────────────────
+#
+# Reported against the live overlay: phantom boxes piling up on a moving
+# scene while the real vehicle went unboxed. The tracker keeps an
+# unmatched track alive at its last box (coasting) — correct for visit
+# continuity, wrong to DRAW. These pin the per-update flag the bus ships
+# so a renderer can tell the two apart.
+
+
+def test_spawn_and_match_set_matched_now():
+    tk = Tracker(FRAME, _cfg(min_initialized=1))
+    (tr,) = tk.update([Detection("car", (100, 100, 200, 200), 0.9)])
+    assert tr.matched_now is True                      # spawned from a detection
+    (tr,) = tk.update([Detection("car", (102, 101, 202, 201), 0.9)])
+    assert tr.matched_now is True                      # matched again
+
+
+def test_a_coasting_track_is_not_matched_now():
+    tk = Tracker(FRAME, _cfg(min_initialized=1))
+    tk.update([Detection("car", (100, 100, 200, 200), 0.9)])
+    (tr,) = tk.update([])                              # confirmed track survives a miss
+    assert tr.matched_now is False
+    assert tr.misses == 1
+
+
+def test_unscanned_coasting_is_not_matched_now_even_with_zero_misses():
+    """THE case that rules out `misses == 0` as the signal: a track whose
+    region was skipped this frame coasts WITHOUT counting a miss, so on
+    misses alone it looks identical to one detected this frame."""
+    tk = Tracker(FRAME, _cfg(min_initialized=1))
+    tk.update([Detection("car", (100, 100, 200, 200), 0.9)])
+    # Scanned a region nowhere near the track → the tracker coasts it.
+    (tr,) = tk.update([], scanned_regions=[(1000, 1000, 1100, 1100)])
+    assert tr.misses == 0
+    assert tr.matched_now is False
+
+
+def test_matched_now_resets_every_update():
+    tk = Tracker(FRAME, _cfg(min_initialized=1))
+    tk.update([Detection("car", (100, 100, 200, 200), 0.9)])
+    tk.update([])
+    (tr,) = tk.update([Detection("car", (101, 101, 201, 201), 0.9)])
+    assert tr.matched_now is True                      # back once re-detected
+
+
+def test_since_match_s_is_zero_on_match_and_grows_while_coasting():
+    t = [100.0]
+    tk = Tracker(FRAME, _cfg(min_initialized=1), clock=lambda: t[0])
+    (tr,) = tk.update([Detection("car", (100, 100, 200, 200), 0.9)])
+    assert tr.since_match_s == 0.0
+    t[0] = 101.5
+    (tr,) = tk.update([], scanned_regions=[(1000, 1000, 1100, 1100)])   # coast, unscanned
+    assert tr.since_match_s == 1.5 and tr.misses == 0
+    t[0] = 102.0
+    (tr,) = tk.update([Detection("car", (101, 101, 201, 201), 0.9)])
+    assert tr.since_match_s == 0.0

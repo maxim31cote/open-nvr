@@ -35,8 +35,10 @@ from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 
 from core.auth import get_current_active_user
-from core.database import get_db
+from core.pagination import resolve_total
+from core.database import get_db, release
 from models import TimelineEvent, User
+from services.camera_scope import visible_camera_ids
 
 router = APIRouter(tags=["timeline"])
 
@@ -51,11 +53,60 @@ def _serialize(e: TimelineEvent) -> dict:
         "score": e.score,
         "track_id": e.track_id,
         "started_at": e.started_at.isoformat() if e.started_at else None,
+        # When the plate on this row was SEEN — the capture time of the
+        # look the read won on. Null on rows with no plate, on reads made
+        # before this existed, and on reads taken from the visit's
+        # evidence frame (which is not a dated look); clients fall back
+        # to started_at, which is the visit's start and NOT the same
+        # moment — on a merged track it can even be a different vehicle.
+        "observed_at": e.observed_at.isoformat() if e.observed_at else None,
         "ended_at": e.ended_at.isoformat() if e.ended_at else None,
         "recording_ref": e.recording_ref,
         "plate_text": e.plate_text,
         "has_evidence": bool(e.evidence_path),
         "evidence_url": f"/api/v1/events/{e.id}/evidence" if e.evidence_path else None,
+        # The crop the plate was READ from (#382), when it differs from the
+        # vehicle-best frame above. Additive and often null — clients fall
+        # back to evidence_url. Deliberately false when the two paths are
+        # EQUAL: the fallback sweep OCRs the evidence frame itself, and
+        # content-addressing then makes them one file, so there is no
+        # second image to offer and the caller should just use evidence_url.
+        "has_plate_evidence": bool(
+            e.plate_evidence_path
+            and e.plate_evidence_path != e.evidence_path
+        ),
+        "plate_evidence_url": (
+            f"/api/v1/events/{e.id}/plate-evidence"
+            if e.plate_evidence_path else None
+        ),
+        # The whole frame behind the best crop. Same flag-plus-url shape,
+        # and the same distinctness guard: a box that filled the frame crops
+        # to the frame itself, and content-addressing then collapses both to
+        # one file — showing that twice, once labelled "scene" and once
+        # "vehicle", is worse than showing it once.
+        "has_scene_evidence": bool(
+            e.scene_evidence_path
+            and e.scene_evidence_path != e.evidence_path
+        ),
+        "scene_evidence_url": (
+            f"/api/v1/events/{e.id}/scene-evidence"
+            if e.scene_evidence_path else None
+        ),
+        # The frame the plate crop was cut from — the one image on the
+        # row guaranteed to show the car the number belongs to, because
+        # a merged track can leave evidence_path and scene_evidence_path
+        # showing a different vehicle entirely. NO distinctness guard
+        # here, unlike the two flags above: when the winning look is the
+        # very crop Tier-0 picked as the visit's best frame, the two
+        # content-address to ONE file — and that file is still the read
+        # frame. The old guard made such rows look like they had no read
+        # frame at all, and the UI (which no longer shows the vehicle
+        # frame as a stand-in) then hid a perfectly good picture.
+        "has_plate_frame": bool(e.plate_frame_path),
+        "plate_frame_url": (
+            f"/api/v1/events/{e.id}/plate-frame"
+            if e.plate_frame_path else None
+        ),
         "payload": e.payload,
     }
 
@@ -69,7 +120,8 @@ async def list_events(
     has_plate: bool = False,
     from_: datetime | None = Query(default=None, alias="from"),
     to: datetime | None = None,
-    limit: int = 100,
+    skip: int = Query(0, ge=0, le=100_000),
+    limit: int = Query(100, ge=1, le=500),
     current_user: User = Depends(get_current_active_user),
     db: Session = Depends(get_db),
 ):
@@ -78,18 +130,47 @@ async def list_events(
     Time filters use the OVERLAP rule — an event counts if any part of it
     intersects [from, to) — because "who was here 3-4pm" must include the
     visit that started 14:58 and left 15:03.
-    """
-    from services.timeline_service import query_events
 
-    rows = query_events(
-        db, camera_id=camera_id, label=label, source=source, plate=plate,
-        has_plate=has_plate, from_=from_, to=to, limit=limit,
-        # Camera data is owner-scoped everywhere in OpenNVR; history and
-        # evidence photos are the MOST sensitive camera data, so the same
-        # rule applies here. Superusers see the fleet.
-        owner_id=None if current_user.is_superuser else current_user.id,
+    Paging is ``skip``/``limit`` (the house shape — audit-logs, cameras,
+    users). ``limit`` is now VALIDATED at the 500 the service always
+    clamped to: silently trimming a larger request was harmless while
+    nothing paged, but a client that believes it asked for 1000 and then
+    asks for skip=1000 would step clean over rows 500-999. A 422 is the
+    honest answer.
+
+    ``skip`` is capped because page numbers invite a "last page" jump,
+    and the last page of a large scoped set is the single most expensive
+    query this endpoint can be asked for.
+
+    Two counts, deliberately different:
+      count  — rows in THIS page (unchanged; every existing client
+               ignores it, which is why it stays rather than moving).
+      total  — rows matching these filters and this caller's scope, for
+               the pager's "1-25 of 312".
+    """
+    from services.timeline_service import count_events, query_events
+
+    # ONE filter dict for the page and the total. That shared dict is the
+    # structural guarantee they cannot drift apart — a total built from a
+    # separately-written query is how a row count for a camera the caller
+    # cannot see leaks out.
+    filters = dict(
+        camera_id=camera_id, label=label, source=source, plate=plate,
+        has_plate=has_plate, from_=from_, to=to,
+        # Camera data is scoped to the caller's cameras (owned + can_view
+        # grants) everywhere in OpenNVR; history and evidence photos are
+        # the MOST sensitive camera data, so the same rule applies here.
+        # Superusers see the fleet.
+        scope=visible_camera_ids(db, current_user),
     )
-    return {"events": [_serialize(e) for e in rows], "count": len(rows)}
+    rows = query_events(db, limit=limit, skip=skip, **filters)
+    total = resolve_total(len(rows), skip, limit,
+                          lambda: count_events(db, **filters))
+    return {
+        "events": [_serialize(e) for e in rows],
+        "count": len(rows),
+        "total": total,
+    }
 
 
 @router.get("/events/{event_id}/evidence")
@@ -112,6 +193,125 @@ async def get_event_evidence(
     path = resolve_evidence(e.evidence_path)
     if path is None:
         raise HTTPException(status_code=404, detail="evidence file missing")
+    # Everything the DB is needed for is done. Do NOT hold a pooled
+    # connection for the length of a client-paced JPEG transfer: FastAPI
+    # closes the session only after the body ships, and nginx runs this
+    # path with proxy_buffering off. See core.database.release.
+    release(db)
+    return FileResponse(path, media_type="image/jpeg",
+                        headers={"Cache-Control": "max-age=86400"})
+
+
+@router.get("/events/{event_id}/plate-evidence")
+async def get_event_plate_evidence(
+    event_id: int,
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db),
+):
+    """The crop this row's PLATE was read from (#382).
+
+    Distinct from the best-frame evidence above: multi-frame OCR reads
+    plate-candidate crops, and the vehicle-best frame is — by
+    construction — usually the one where the plate has left the crop.
+    404 when the read came from the evidence frame itself or predates
+    the column; callers fall back to ``/evidence``.
+    """
+    e = db.query(TimelineEvent).filter(TimelineEvent.id == event_id).first()
+    if e is None or not e.plate_evidence_path:
+        raise HTTPException(status_code=404,
+                            detail="no plate evidence for this event")
+    from services.timeline_service import can_access_event
+
+    if not can_access_event(db, e, user=current_user):
+        # 404, not 403: don't confirm the event exists on someone else's camera.
+        raise HTTPException(status_code=404,
+                            detail="no plate evidence for this event")
+    from services.evidence_store import resolve_evidence
+
+    path = resolve_evidence(e.plate_evidence_path)
+    if path is None:
+        raise HTTPException(status_code=404, detail="evidence file missing")
+    # Everything the DB is needed for is done. Do NOT hold a pooled
+    # connection for the length of a client-paced JPEG transfer: FastAPI
+    # closes the session only after the body ships, and nginx runs this
+    # path with proxy_buffering off. See core.database.release.
+    release(db)
+    return FileResponse(path, media_type="image/jpeg",
+                        headers={"Cache-Control": "max-age=86400"})
+
+
+@router.get("/events/{event_id}/scene-evidence")
+async def get_event_scene_evidence(
+    event_id: int,
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db),
+):
+    """The whole frame the best crop was taken from.
+
+    ``/evidence`` is framed for the subject and cannot show the lane, the
+    gate, or the car parked next to it; this is the same moment, uncropped.
+    404 when the pipeline sent no scene frame or the row predates the
+    column — callers fall back to ``/evidence``.
+    """
+    e = db.query(TimelineEvent).filter(TimelineEvent.id == event_id).first()
+    if e is None or not e.scene_evidence_path:
+        raise HTTPException(status_code=404,
+                            detail="no scene evidence for this event")
+    from services.timeline_service import can_access_event
+
+    if not can_access_event(db, e, user=current_user):
+        # 404, not 403: don't confirm the event exists on someone else's camera.
+        raise HTTPException(status_code=404,
+                            detail="no scene evidence for this event")
+    from services.evidence_store import resolve_evidence
+
+    path = resolve_evidence(e.scene_evidence_path)
+    if path is None:
+        raise HTTPException(status_code=404, detail="evidence file missing")
+    # Everything the DB is needed for is done. Do NOT hold a pooled
+    # connection for the length of a client-paced JPEG transfer: FastAPI
+    # closes the session only after the body ships, and nginx runs this
+    # path with proxy_buffering off. See core.database.release.
+    release(db)
+    return FileResponse(path, media_type="image/jpeg",
+                        headers={"Cache-Control": "max-age=86400"})
+
+
+@router.get("/events/{event_id}/plate-frame")
+async def get_event_plate_frame(
+    event_id: int,
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db),
+):
+    """The frame this row's plate crop was cut from.
+
+    ``/plate-evidence`` is the plate rectangle; this is everything around
+    it — the vehicle the number belongs to, at the moment it was read.
+    Distinct from ``/evidence`` and ``/scene-evidence``, which show the
+    visit's best-thumbnail moment and can be a different car when track
+    association merged two vehicles into one visit. 404 for rows read
+    before the column existed; callers fall back to ``/evidence``.
+    """
+    e = db.query(TimelineEvent).filter(TimelineEvent.id == event_id).first()
+    if e is None or not e.plate_frame_path:
+        raise HTTPException(status_code=404,
+                            detail="no plate frame for this event")
+    from services.timeline_service import can_access_event
+
+    if not can_access_event(db, e, user=current_user):
+        # 404, not 403: don't confirm the event exists on someone else's camera.
+        raise HTTPException(status_code=404,
+                            detail="no plate frame for this event")
+    from services.evidence_store import resolve_evidence
+
+    path = resolve_evidence(e.plate_frame_path)
+    if path is None:
+        raise HTTPException(status_code=404, detail="evidence file missing")
+    # Everything the DB is needed for is done. Do NOT hold a pooled
+    # connection for the length of a client-paced JPEG transfer: FastAPI
+    # closes the session only after the body ships, and nginx runs this
+    # path with proxy_buffering off. See core.database.release.
+    release(db)
     return FileResponse(path, media_type="image/jpeg",
                         headers={"Cache-Control": "max-age=86400"})
 
@@ -130,7 +330,7 @@ async def get_plate_stats(
     return plate_stats(
         db,
         days=max(1, min(int(days), 90)),
-        owner_id=None if current_user.is_superuser else current_user.id,
+        scope=visible_camera_ids(db, current_user),
     )
 
 
@@ -150,7 +350,7 @@ async def get_plate_summary(
     return plate_summary(
         db,
         plate=plate,
-        owner_id=None if current_user.is_superuser else current_user.id,
+        scope=visible_camera_ids(db, current_user),
     )
 
 
@@ -189,7 +389,7 @@ async def get_plate_sessions(
         plate=plate,
         in_cameras=_parse_camera_ids(in_cameras),
         out_cameras=_parse_camera_ids(out_cameras),
-        owner_id=None if current_user.is_superuser else current_user.id,
+        scope=visible_camera_ids(db, current_user),
         limit=max(1, min(int(limit), 200)),
     )
 
@@ -211,7 +411,7 @@ async def get_gate_occupancy(
         in_cameras=_parse_camera_ids(in_cameras),
         out_cameras=_parse_camera_ids(out_cameras),
         hours=max(1, min(int(hours), 24 * 7)),
-        owner_id=None if current_user.is_superuser else current_user.id,
+        scope=visible_camera_ids(db, current_user),
     )
 
 
@@ -232,5 +432,5 @@ async def get_vehicle_report(
         db,
         year=year,
         month=month,
-        owner_id=None if current_user.is_superuser else current_user.id,
+        scope=visible_camera_ids(db, current_user),
     )

@@ -101,9 +101,43 @@ class Track:
     # Monotonic timestamp of the last positive match (set at spawn and on
     # every match) — the coast-TTL expiry anchor.
     last_matched: float = 0.0
+    # True for exactly the update() in which this track was matched to a
+    # detection (or spawned from one); False while it COASTS. Not the same
+    # as ``misses == 0``: a track coasting unscanned never counts a miss,
+    # so misses cannot tell "seen this frame" from "not looked for". The
+    # bus ships this so a live overlay draws only what was actually
+    # detected — a coasting track at its last box read as a phantom.
+    matched_now: bool = field(default=False, compare=False)
+    # Seconds since the last positive match, stamped at the end of every
+    # update() from the tracker's own clock. 0.0 on the frame it was
+    # matched; grows while it coasts. This — not matched_now alone — is
+    # what a live renderer needs: under a detector budget a present object
+    # is re-verified every few frames, not every frame, so "matched this
+    # frame" flickers, while "matched within the last couple of seconds"
+    # is steady for anything real and false for a phantom whose spot is
+    # never scanned again.
+    since_match_s: float = field(default=0.0, compare=False)
     # BGR crop of the best frame, retained only when the tracker is fed pixels
     # (the Tier-1 gate dispatches THIS on escalation — see gate/dispatch, PR B #10).
     best_crop: object | None = field(default=None, repr=False, compare=False)
+    # Monotonic capture stamp of the frame best_crop came from, set with it.
+    # A visit whose camera has no LPR skill ships no plate candidates, so
+    # core's sweep OCRs THIS crop — and without a time of its own that read
+    # got no observed_at at all, which is every read on a default install
+    # (#451). Same clock as the candidate ring, so both convert alike.
+    best_crop_ts: float | None = field(default=None, compare=False)
+    # Multi-frame OCR: top-K plate-readability-scored crops spread across
+    # the pass (vehicle labels on LPR cameras only — None everywhere else,
+    # so non-LPR deployments pay zero memory or scoring cost).
+    plate_ring: object | None = field(default=None, repr=False, compare=False)
+    # JPEG of the WHOLE frame the best crop was taken from — the visit's
+    # second evidence image (best_crop answers "what was it", this answers
+    # "where, and what else was in shot"). Encoded EAGERLY, at best-frame
+    # update time, rather than kept as pixels: a 1080p BGR array is 6.2 MB,
+    # so one per track is 310 MB per camera at DETECT_MAX_TRACKS=50.
+    # repr=False is load-bearing, not cosmetic — 150 KB of bytes in a log
+    # line or a pytest assertion diff is its own outage.
+    best_scene_jpeg: object | None = field(default=None, repr=False, compare=False)
 
     @property
     def stationary(self) -> bool:
@@ -182,6 +216,32 @@ class Tracker:
         # Spawns refused because the track cap or spawn-score floor was hit —
         # observability for the bounded-load guards (service exports it).
         self.spawns_dropped = 0
+        # Multi-frame OCR (opt-in per camera): retain top-K plate candidates
+        # on vehicle tracks. The worker enables this only when the camera's
+        # assignments include the LPR skill.
+        self.retain_plate_candidates: bool = False
+        self.plate_candidates_max: int = 4
+        self.plate_candidates_gap_s: float = 0.75
+        # Context kept around the detection box in every stored crop (the
+        # visit's evidence AND the plate candidates), as a fraction of
+        # the box per side. 0.25 keeps the subject dominant; a wider
+        # margin survives a detector box that trails a moving car (the
+        # read frame then shows the whole car, not a car with its tail
+        # cut off). Purely cosmetic for reading: the OCR localises the
+        # plate inside whatever it is given.
+        self.crop_margin: float = 0.25
+        # Scene evidence: the whole frame behind best_crop, as JPEG. Off
+        # here so every existing caller and test pays one boolean per
+        # best-frame update; the worker opts in from env.
+        self.retain_scene: bool = False
+        self.scene_max_px: int = 1280
+        self.scene_quality: int = 78
+        # Per-frame encode memo. 50 tracks peaking on the SAME frame must
+        # cost one imencode, not 50 — and the frame reference is dropped at
+        # the end of update(), so nothing holds 6 MB between frames.
+        self._scene_bgr = None
+        self._scene_jpeg: bytes | None = None
+        self._scene_done = False
 
     @property
     def population(self) -> int:
@@ -214,6 +274,13 @@ class Tracker:
         # behavior: every unmatched track counts a miss.
         cfg = self.config
         now = self._clock()
+        # Every track starts this update unmatched; _match/_spawn set it.
+        for tr in self._tracks:
+            tr.matched_now = False
+        # This frame's scene memo. Stamped here, cleared before the return:
+        # the encode is shared by every track that peaks on this frame, and
+        # the frame reference never outlives the call.
+        self._scene_bgr, self._scene_jpeg, self._scene_done = bgr, None, False
         unmatched_tracks = set(range(len(self._tracks)))
         unmatched_dets = set(range(len(detections)))
 
@@ -278,6 +345,13 @@ class Tracker:
                     continue
             survivors.append(tr)
         self._tracks = survivors
+        for tr in survivors:
+            tr.since_match_s = max(0.0, now - tr.last_matched)
+        # Drop the frame reference: holding it would keep 6 MB alive between
+        # frames for nothing. (An exception escaping above leaves one frame
+        # referenced, and that path already unwinds into the worker's
+        # crashed-camera handler, which drops the whole Tracker.)
+        self._scene_bgr, self._scene_jpeg, self._scene_done = None, None, False
         return self.tracks
 
     def _match(self, tr: Track, det: Detection, bgr=None, now: float | None = None) -> None:
@@ -291,6 +365,7 @@ class Tracker:
         tr.hits += 1
         tr.age += 1
         tr.misses = 0
+        tr.matched_now = True
         tr.last_matched = now if now is not None else self._clock()
         if not tr.confirmed and tr.hits >= self.config.initialized():
             tr.confirmed = True
@@ -304,6 +379,7 @@ class Tracker:
             score=det.score,
             stationary_threshold=self.config.stationary_threshold,
             last_matched=now if now is not None else self._clock(),
+            matched_now=True,
         )
         tr.confirmed = self.config.initialized() <= 1
         self._update_best(tr, det, bgr)
@@ -314,6 +390,68 @@ class Tracker:
         if tr.best is None or is_better_thumbnail(tr.best, cand, self.frame_shape):
             tr.best = cand
             if bgr is not None:                       # retain the best frame's pixels
-                crop = _crop_bgr(bgr, det.box)
+                crop = _crop_bgr(bgr, det.box, margin=self.crop_margin)
                 if crop is not None:
                     tr.best_crop = crop
+                    tr.best_crop_ts = self._clock()
+                    # Gated on the crop, so the two evidence images always
+                    # describe the SAME frame — a scene whose crop was
+                    # rejected would be an inconsistent pair.
+                    scene = self._scene_jpeg_for(bgr)
+                    if scene is not None:
+                        tr.best_scene_jpeg = scene
+        self._update_plate_candidates(tr, det, bgr)
+
+    def _scene_jpeg_for(self, bgr) -> bytes | None:
+        """This frame as JPEG — encoded at most ONCE per ``update`` call.
+
+        Eager encode rather than retained pixels. The best frame changes
+        O(log(area growth)) times per visit (is_better_thumbnail wants +0.05
+        score or +10% area — roughly 34 times for a car growing 100px to
+        500px wide, not once per frame), so the CPU is a rounding error,
+        while holding the BGR array would be 6.2 MB x DETECT_MAX_TRACKS per
+        camera. Tracks that peak on the same frame share the same immutable
+        bytes object.
+
+        A failed encode is cached as a failure (``_scene_done``), so one bad
+        frame costs one attempt, not one per track — and never costs the
+        visit its crop, which is the image that actually matters.
+        """
+        if not self.retain_scene or bgr is None:
+            return None
+        if self._scene_bgr is bgr and self._scene_done:
+            return self._scene_jpeg
+        try:
+            from .bestframe import encode_scene_jpeg
+
+            self._scene_jpeg = encode_scene_jpeg(
+                bgr, max_px=self.scene_max_px, quality=self.scene_quality,
+            )
+        except Exception:
+            self._scene_jpeg = None
+        self._scene_bgr, self._scene_done = bgr, True
+        return self._scene_jpeg
+
+    def _update_plate_candidates(self, tr: Track, det: Detection, bgr=None) -> None:
+        """Multi-frame OCR: offer this frame's crop to the track's
+        plate-candidate ring. Guarded to vehicles + opt-in + pixels
+        present, so every other code path is a two-comparison no-op."""
+        if not self.retain_plate_candidates or bgr is None:
+            return
+        from .platecands import (
+            VEHICLE_LABELS, CandidateRing, candidate_score,
+        )
+        if det.label not in VEHICLE_LABELS:
+            return
+        crop = _crop_bgr(bgr, det.box, margin=self.crop_margin)
+        if crop is None:
+            return
+        if tr.plate_ring is None:
+            tr.plate_ring = CandidateRing(
+                max_candidates=self.plate_candidates_max,
+                min_gap_s=self.plate_candidates_gap_s,
+            )
+        from .regions import area as _area
+        tr.plate_ring.offer(
+            self._clock(), candidate_score(_area(det.box), crop), crop,
+        )

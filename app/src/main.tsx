@@ -30,6 +30,7 @@ import { ErrorBoundary } from './components/ErrorBoundary'
 import { Login } from './views/Login'
 import { MFASetup } from './views/MFASetup'
 import { MFAVerify } from './views/MFAVerify'
+import { I18nProvider } from './i18n'
 
 // Views are lazy-loaded so each route becomes its own chunk instead of one
 // monolithic bundle. Auth/MFA stay eager: they gate first paint.
@@ -88,6 +89,7 @@ const Logs = lazy(reloadOnStale(() => import('./views/Logs').then((m) => ({ defa
 const AIEngine = lazy(reloadOnStale(() => import('./views/AIEngine').then((m) => ({ default: m.AIEngine }))))
 const Compliance = lazy(reloadOnStale(() => import('./views/Compliance').then((m) => ({ default: m.Compliance }))))
 const AlertsIncidents = lazy(reloadOnStale(() => import('./views/AlertsIncidents').then((m) => ({ default: m.AlertsIncidents }))))
+const Alarms = lazy(reloadOnStale(() => import('./views/Alarms').then((m) => ({ default: m.Alarms }))))
 const Integrations = lazy(reloadOnStale(() => import('./views/Integrations').then((m) => ({ default: m.Integrations }))))
 const Support = lazy(reloadOnStale(() => import('./views/Support').then((m) => ({ default: m.Support }))))
 const AccessControl = lazy(reloadOnStale(() => import('./views/AccessControl').then((m) => ({ default: m.AccessControl }))))
@@ -179,6 +181,7 @@ const router = createBrowserRouter([
           { path: 'app-catalog/:appId', element: <AppView /> },
           { path: 'compliance', element: <Compliance /> },
           { path: 'alerts-incidents', element: <AlertsIncidents /> },
+          { path: 'alarms', element: <Alarms /> },
           { path: 'integrations', element: <Integrations /> },
           { path: 'onvif-tools', element: <OnvifTools /> },
           { path: 'cloud', element: <Cloud /> },
@@ -199,15 +202,17 @@ const router = createBrowserRouter([
 
 ReactDOM.createRoot(document.getElementById('root')!).render(
   <ErrorBoundary title="OpenNVR hit an unexpected error">
-    <QueryClientProvider client={queryClient}>
-      <AuthProvider>
-        <PermissionsProvider>
-          <SnackbarProvider>
-            <RouterProvider router={router} />
-          </SnackbarProvider>
-        </PermissionsProvider>
-      </AuthProvider>
-    </QueryClientProvider>
+    <I18nProvider>
+      <QueryClientProvider client={queryClient}>
+        <AuthProvider>
+          <PermissionsProvider>
+            <SnackbarProvider>
+              <RouterProvider router={router} />
+            </SnackbarProvider>
+          </PermissionsProvider>
+        </AuthProvider>
+      </QueryClientProvider>
+    </I18nProvider>
   </ErrorBoundary>
 )
 

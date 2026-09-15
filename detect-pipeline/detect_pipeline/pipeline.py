@@ -72,6 +72,13 @@ class FrameResult:
     # True when the per-frame region budget dropped at least one candidate
     # this frame (exported as tier0_regions_capped_total — no silent caps).
     regions_capped: bool = False
+    # Motion-gate state, for metrics. ``motion_forced_exit`` is a per-frame
+    # EDGE (did the calibration deadline fire on this frame?), not the
+    # detector's running total — a cumulative value fed to a Prometheus
+    # ``inc`` would compound every frame. ``motion_latched_open`` says the
+    # gate gave up on a scene with no static background.
+    motion_forced_exit: bool = False
+    motion_latched_open: bool = False
     # Per-stage wall time for the frame (decode/motion/region/detect/track) — lets
     # the test-bed see *where* time goes, not just the end-to-end total.
     stage_latency_s: dict[str, float] = field(default_factory=dict)
@@ -201,11 +208,18 @@ class DetectPipeline:
             _t = time.monotonic()
             tracks = self.tracker.update([])
             stages["track"] = time.monotonic() - _t
-            return FrameResult(tracks, motion_boxes, [], True, stage_latency_s=stages)
+            return FrameResult(
+                tracks, motion_boxes, [], True, stage_latency_s=stages,
+                motion_forced_exit=getattr(
+                    self.motion, "forced_exit_this_frame", False),
+                motion_latched_open=getattr(
+                    self.motion, "latched_open", False),
+            )
 
         frame_shape = (frame.height, frame.width)
         self._frame_idx += 1
-        track_boxes: list[Box] = []
+        # (last_matched, id, box): the order the budget will consider them in.
+        candidates: list[tuple[float, int, Box]] = []
         skipped = 0
         for t in self.tracker.tracks:
             if (
@@ -221,12 +235,20 @@ class DetectPipeline:
             ):
                 skipped += 1
                 continue
-            track_boxes.append(t.box)
-        # Rotate the track-region candidates by frame index so the per-frame
-        # budget round-robins across tracks instead of starving the tail.
-        if self.max_regions > 0 and len(track_boxes) > 1:
-            off = self._frame_idx % len(track_boxes)
-            track_boxes = track_boxes[off:] + track_boxes[:off]
+            candidates.append((getattr(t, "last_matched", 0.0), t.id, t.box))
+        # Under a region budget the reserve goes to the tracks that have
+        # WAITED LONGEST since their last positive match. This used to be a
+        # round-robin by frame index (`frame_idx % len(track_boxes)`), but
+        # the candidate count changes every frame as tracks spawn, expire
+        # and get stationary-skipped, so the modulo aliased and some tracks
+        # were skipped again and again: measured on a busy dashcam scene
+        # with the budget shed to 4 regions, present objects went 6–11 s
+        # between re-verifications while the median was under 3 s. Oldest
+        # first is deterministic and bounds the wait at ~(tracks / reserve)
+        # frames for everyone; the id breaks ties so equal ages stay stable.
+        if self.max_regions > 0 and len(candidates) > 1:
+            candidates.sort(key=lambda c: (c[0], c[1]))
+        track_boxes: list[Box] = [c[2] for c in candidates]
         _t = time.monotonic()
         regions, regions_capped = select_regions(
             motion_boxes, track_boxes, frame_shape, self.min_region, self.region_multiplier,
@@ -272,6 +294,9 @@ class DetectPipeline:
             detections=dets, detect_latency_s=detect_latency_s, stage_latency_s=stages,
             skipped_stationary=skipped, regions_capped=regions_capped,
             track_population=self.tracker.population,
+            motion_forced_exit=getattr(
+                self.motion, "forced_exit_this_frame", False),
+            motion_latched_open=getattr(self.motion, "latched_open", False),
         )
 
     def run(self, on_tracks: OnTracks | None = None) -> None:

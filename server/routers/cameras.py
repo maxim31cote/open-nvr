@@ -28,10 +28,12 @@ from sqlalchemy import and_, func, or_
 from sqlalchemy.orm import Session
 
 from core.auth import get_current_active_user, get_current_superuser
-from core.config import settings
+from urllib.parse import urlparse
+
+from core.config import _host_is_internal, settings
 from core.database import get_db
 from core.logging_config import camera_logger
-from core.permissions import get_camera_or_403
+from core.permissions import RequirePermission, get_camera_or_403
 from models import (
     Camera,
     CameraConfig,
@@ -46,6 +48,7 @@ from schemas import (
     CameraHardDeleteRequest,
     CameraList,
     CameraPermissionAssign,
+    CameraPermissionEntry,
     CameraPermissionResponse,
     CameraResponse,
     CameraUpdate,
@@ -275,6 +278,42 @@ def _check_duplicate_ips(db: Session, user_id: int, cam: Camera):
         )
 
 
+#: Adding a camera makes the caller its OWNER — and an owner sees that
+#: camera everywhere (timeline, alerts, apps). Left open to any active
+#: user, "add a camera" was a self-service way to widen one's own scope.
+#: ``cameras.manage`` is the seeded permission the operator role holds
+#: and the viewer role does not (scripts/init_db.py), and the one the
+#: UI already keys its Add Camera button on.
+require_cameras_manage = RequirePermission("cameras.manage")
+
+
+def _reject_external_camera_hosts(camera_create) -> None:
+    """403 unless every host this create would dial is on the operator's
+    own network. Covers ``ip_address`` and the host inside ``rtsp_url``,
+    which are separate caller-controlled inputs reached by different code
+    paths."""
+    hosts: list[tuple[str, str]] = []
+    if camera_create.ip_address:
+        hosts.append(("ip_address", str(camera_create.ip_address)))
+    if camera_create.rtsp_url:
+        try:
+            parsed = urlparse(str(camera_create.rtsp_url))
+        except Exception:
+            raise HTTPException(status_code=400, detail="rtsp_url is not a valid URL")
+        if parsed.hostname:
+            hosts.append(("rtsp_url", parsed.hostname))
+
+    for field, host in hosts:
+        if not _host_is_internal(host):
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    f"Refusing to reach non-internal address {host!r} "
+                    f"({field}); cameras are reached on the local network."
+                ),
+            )
+
+
 @router.post("/", response_model=CameraResponse)
 async def create_camera(
     camera_create: CameraCreate,
@@ -283,10 +322,11 @@ async def create_camera(
         description="Add the camera even when its IP or RTSP URL matches an existing one.",
     ),
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_active_user),
+    current_user: User = Depends(require_cameras_manage),
     request: Request = None,
 ):
-    """Create a new camera.
+    """Create a new camera. Requires the ``cameras.manage`` permission
+    (superusers hold it implicitly).
 
     When no RTSP URL is supplied but credentials are, the server derives it
     from the IP + credentials (ONVIF direct-connect, then vendor RTSP
@@ -294,6 +334,25 @@ async def create_camera(
     only need IP + username + password.
     """
     _log_camera_creation_start(current_user.id, camera_create, request)
+
+    # SSRF guard, mirroring routers/onvif.py:83, which has always had it —
+    # camera-create did not. It runs FIRST, before any branch, because
+    # this handler dials the caller's input from four places and they do
+    # not share a condition:
+    #   resolve_source()          ip_address, when no rtsp_url was given
+    #   fetch_identity()          ip_address, when one WAS given
+    #   sync_camera_time()        ip_address
+    #   TransportProbeService     the rtsp_url HOST — and this one runs
+    #                             even with no credentials at all
+    # Guarding inside the credentials branch (as the first cut of this fix
+    # did) left that last path wide open: post a camera with no username
+    # and an rtsp_url of your choosing and the server still opens a TCP +
+    # TLS connection to it.
+    #
+    # Blind — nothing is reflected — but it is still this server's network
+    # being used as someone else's port scanner, or as an out-of-band
+    # beacon to a host they control.
+    _reject_external_camera_hosts(camera_create)
 
     # Referenced after creation regardless of the credentials branch below —
     # without these initializers a credential-less create crashed with
@@ -986,7 +1045,7 @@ async def update_camera(
     camera_update: CameraUpdate,
     camera: Camera = Depends(get_camera_or_403),
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_active_user),
+    current_user: User = Depends(require_cameras_manage),
     request: Request = None,
 ):
     """Update camera information (owner or superuser).
@@ -1432,7 +1491,7 @@ async def delete_camera(
     camera_id: int,
     camera: Camera = Depends(get_camera_or_403),
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_active_user),
+    current_user: User = Depends(require_cameras_manage),
     request: Request = None,
 ):
     """Delete a camera (irreversible soft delete).
@@ -1474,6 +1533,12 @@ async def delete_camera(
         # Irreversible soft delete: tombstone + deactivate.
         camera.is_active = False
         camera.deleted_at = datetime.now(UTC)
+        # #372: a binned camera must not keep claiming skills — a stale
+        # claim scoped consumers (the LPR app) to a camera that no
+        # longer exists while every live camera was ignored. Released in
+        # the same commit as the tombstone.
+        from services.skill_assignments import release_camera_claims
+        released_claims = release_camera_claims(db, camera_id)
         db.commit()
 
         camera_logger.log_action(
@@ -1497,6 +1562,7 @@ async def delete_camera(
                     "camera_name": camera_name,
                     "deleted_at": camera.deleted_at.isoformat(),
                     "stream_teardown": (teardown or {}).get("status", "failed"),
+                    "skill_claims_released": released_claims,
                 },
                 ip=request.client.host if request and request.client else None,
                 user_agent=request.headers.get("user-agent") if request else None,
@@ -1618,6 +1684,12 @@ async def hard_delete_camera(
     camera_event_rows = (
         db.query(CameraEvent).filter(CameraEvent.camera_id == camera_id).delete()
     )
+    # #372: skill claims have a plain FK to cameras (no cascade) — they
+    # must go before the camera row, and normally already went at soft
+    # delete; this catches rows left by installs that binned the camera
+    # before that cleanup existed.
+    from services.skill_assignments import release_camera_claims
+    release_camera_claims(db, camera_id)
     db.delete(camera)
     db.commit()
 
@@ -1692,6 +1764,39 @@ def assign_camera_permission(
     except Exception:
         pass
     return perm
+
+
+@router.get("/{camera_id}/permissions", response_model=list[CameraPermissionEntry])
+def list_camera_permissions(
+    camera_id: int,
+    camera: Camera = Depends(get_camera_or_403),
+    db: Session = Depends(get_db),
+):
+    """Every grant on a camera — who may view it, who may manage it —
+    with the owner listed first. Owner or superuser (the same gate as
+    assigning); the assignment API was write-only before this, so an
+    admin could grant but never audit."""
+    rows = (
+        db.query(CameraPermission, User.username)
+        .join(User, User.id == CameraPermission.user_id)
+        .filter(CameraPermission.camera_id == camera.id)
+        .order_by(User.username.asc())
+        .all()
+    )
+    out: list[CameraPermissionEntry] = []
+    if camera.owner_id is not None:
+        owner = db.query(User).filter(User.id == camera.owner_id).first()
+        out.append(CameraPermissionEntry(
+            user_id=camera.owner_id, username=owner.username if owner else None,
+            can_view=True, can_manage=True, is_owner=True))
+    for perm, username in rows:
+        if perm.user_id == camera.owner_id:
+            continue
+        out.append(CameraPermissionEntry(
+            user_id=perm.user_id, username=username,
+            can_view=bool(perm.can_view), can_manage=bool(perm.can_manage),
+            is_owner=False))
+    return out
 
 
 @router.delete("/{camera_id}/permissions/{user_id}")

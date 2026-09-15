@@ -21,6 +21,7 @@ class _Tr:
     stationary: bool = False
     confirmed: bool = True
     best_crop: object = field(default=None)
+    best_scene_jpeg: object = field(default=None)
 
 
 # ── lifecycle ───────────────────────────────────────────────────────
@@ -260,3 +261,148 @@ def test_drain_thread_survives_a_failure_inside_its_own_handler():
 
     assert seen["handler_calls"] >= 3, "drain stopped after the first failure"
     assert p.is_alive(), "drain thread died and took all persistence with it"
+
+
+# ── scene evidence ──────────────────────────────────────────────────
+
+
+def test_scene_rides_the_visit_without_being_re_encoded(monkeypatch):
+    """The tracker already encoded it (eagerly, to avoid holding 6 MB of
+    pixels per track), so _finish must carry the bytes through untouched —
+    unlike crop and the candidates, which arrive as pixels."""
+    import detect_pipeline.bestframe as bf
+    calls = {"n": 0}
+
+    def enc(crop, quality=85):
+        calls["n"] += 1
+        return b"CROPJPEG"
+
+    monkeypatch.setattr(bf, "_encode_jpeg", enc)
+    lc = VisitLifecycle("3")
+    tr = _Tr(1, best_crop=object(), best_scene_jpeg=b"SCENEJPEG")
+    lc.observe([tr], T0)
+    lc.observe([tr], T0 + 2)                       # a visit needs duration
+    done = lc.observe([], T0 + 3)
+    assert done[0].scene_jpeg == b"SCENEJPEG"
+    assert calls["n"] == 1, "the scene was re-encoded"
+
+
+def test_a_tracker_without_the_field_still_finishes_visits():
+    """getattr with a default, like best_crop: older trackers and every test
+    double that predates the field must not break the lifecycle."""
+    @dataclass
+    class _Old:
+        id: int
+        label: str = "person"
+        score: float = 0.8
+        stationary: bool = False
+        confirmed: bool = True
+
+    lc = VisitLifecycle("3")
+    lc.observe([_Old(1)], T0)
+    lc.observe([_Old(1)], T0 + 2)
+    done = lc.observe([], T0 + 3)
+    assert len(done) == 1 and done[0].scene_jpeg is None
+
+
+def test_post_carries_the_scene():
+    posted = {}
+
+    def opener(req, timeout=None):
+        posted["body"] = json.loads(req.data.decode())
+        return _Resp()
+
+    p = VisitPoster("http://core", api_key="k", opener=opener)
+    p._post(replace(_visit(b"crop"), scene_jpeg=b"scene"))
+    import base64
+    assert base64.b64decode(posted["body"]["scene_jpeg_b64"]) == b"scene"
+
+
+def test_post_omits_the_scene_when_absent():
+    """Omitted, not null: a core that predates the field never sees a key it
+    has no opinion about."""
+    posted = {}
+
+    def opener(req, timeout=None):
+        posted["body"] = json.loads(req.data.decode())
+        return _Resp()
+
+    p = VisitPoster("http://core", api_key="k", opener=opener)
+    p._post(_visit(b"crop"))
+    assert "scene_jpeg_b64" not in posted["body"]
+
+
+def test_visit_still_takes_its_original_positional_arguments():
+    """scene_jpeg was appended LAST for this reason — the dataclass is frozen
+    and constructed positionally in this file and in the bench."""
+    v = _visit(b"crop")
+    assert v.camera_id == "3" and v.jpeg == b"crop"
+    assert v.scene_jpeg is None and v.candidate_jpegs == ()
+
+
+# ── candidate capture times (#451) ─────────────────────────────────
+
+
+def test_post_carries_the_candidates_capture_times():
+    """Core dates the winning read by these — without them a plate row
+    falls back to the visit's START, which on a merged track is when a
+    DIFFERENT car arrived."""
+    posted = {}
+
+    def opener(req, timeout=None):
+        posted["body"] = json.loads(req.data.decode())
+        return _Resp()
+
+    p = VisitPoster("http://core", api_key="k", opener=opener)
+    p._post(replace(_visit(b"crop"),
+                    candidate_jpegs=(b"a", b"b"),
+                    candidate_ts=(11.5, 12.5)))
+    assert posted["body"]["candidate_ts"] == [11.5, 12.5]
+    assert len(posted["body"]["candidate_jpegs_b64"]) == 2
+
+
+def test_post_drops_stamps_that_do_not_line_up_with_the_crops():
+    """A short list is worse than none: core zips the two, so every read
+    past the gap would inherit a different look's timestamp."""
+    posted = {}
+
+    def opener(req, timeout=None):
+        posted["body"] = json.loads(req.data.decode())
+        return _Resp()
+
+    p = VisitPoster("http://core", api_key="k", opener=opener)
+    p._post(replace(_visit(b"crop"),
+                    candidate_jpegs=(b"a", b"b"),
+                    candidate_ts=(11.5,)))
+    assert "candidate_ts" not in posted["body"]
+    assert len(posted["body"]["candidate_jpegs_b64"]) == 2
+
+
+def test_finished_visit_dates_each_candidate_it_ships():
+    """The stamps come off the ring, so they describe the LOOK, not the
+    moment the visit closed."""
+    import numpy as np
+
+    from detect_pipeline.platecands import CandidateRing
+
+    ring = CandidateRing(min_gap_s=0.0)
+    ring.offer(T0 + 1, 10.0, np.zeros((8, 8, 3), np.uint8))
+    ring.offer(T0 + 2, 90.0, np.zeros((8, 8, 3), np.uint8))
+
+    class _Car:
+        id = 1
+        label = "car"
+        score = 0.9
+        confirmed = True
+        best_crop = None
+        plate_ring = ring
+
+    lc = VisitLifecycle("3")
+    lc.observe([_Car()], T0)
+    lc.observe([_Car()], T0 + 3)
+    done = lc.observe([], T0 + 4)
+    assert len(done) == 1
+    v = done[0]
+    # One stamp per shipped crop, and none of them is the visit's end.
+    assert len(v.candidate_ts) == len(v.candidate_jpegs) == 2
+    assert all(isinstance(t, float) for t in v.candidate_ts)

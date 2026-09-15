@@ -463,6 +463,15 @@ A few notes on the shape:
   fingerprint (e.g., cloud-fronting adapters) omit the field; KAI-C
   surfaces "model identity not verifiable" in the UI rather than
   silently trusting.
+- `model.license` (optional, additive since adapter SDK 1.3) —
+  `{source, site_id, plan, expires_at}` when the loaded weights came
+  from a signed, licensed bundle (OpenNVR Models, or a site's own
+  signed fine-tune; [`design/models-service.md`](design/models-service.md)).
+  The adapter verified the bundle's Ed25519-signed manifest and every
+  file's hash before loading; `model.fingerprint` is then the manifest
+  hash, identifying weights, site and licence in one string. Absent for
+  stock weights. KAI-C ignores fields it does not know, so gateways
+  older than the field are unaffected.
 
 ### 4.1 The canonical task taxonomy — "curated + open"
 
@@ -1632,7 +1641,7 @@ Seven adapters ship in v0.1, all conforming to this contract and pulled from `gh
 | InsightFace | IMAGE | face_detection, face_recognition | REST-based face DB (no shared-volume coupling). |
 | Whisper | AUDIO | speech_to_text | `faster-whisper` runtime, CPU + GPU. |
 | Piper | AUDIO | text_to_speech | Inline-audio response option for low-latency loops. |
-| fast-plate-ocr | IMAGE | license_plate_recognition | Two-stage chain candidate with YOLOv8. |
+| fast-plate-ocr | IMAGE | license_plate_recognition | Ships the two-stage chain: localises the plate (yolo-v9-t-384-license-plate-end2end) before OCR, and returns `plate_detection{found, box, confidence}` alongside `plate_text`. |
 | BLIP | IMAGE | image_captioning | Scene-caption adapter used by the camera-agent. |
 | ByteTrack | GENERIC | multi_object_tracking | First non-detection adapter — post-processor over an upstream detector's results. |
 

@@ -45,6 +45,12 @@ class NatsSubscriberMixin:
     def stop(self) -> None:
         self._stop_event.set()
 
+    def _nats_subjects(self) -> list[str]:
+        """The subjects to subscribe to. Archetypes with one pattern use
+        ``cfg.subject_pattern``; a host may override to return several
+        (DomainEventSubscriber subscribes to each contracted schema)."""
+        return [self.cfg.subject_pattern]
+
     def _handle_raw(self, data: bytes, *, subject: str = "") -> Any:
         """Per-message entry point — implemented by the archetype
         (decode + isolate + dispatch)."""
@@ -53,24 +59,38 @@ class NatsSubscriberMixin:
     async def _run_nats_loop(self, *, once: bool) -> None:
         import nats
 
+        from .credentials import bus_connection
+
         connect_kwargs: dict[str, Any] = {
-            "servers": [self.cfg.nats_url],
             "connect_timeout": 5.0,
             "reconnect_time_wait": 1.0,
             "max_reconnect_attempts": -1,
         }
-        token = getattr(self.cfg, "nats_token", None)
-        if token:
-            connect_kwargs["token"] = token
+        # The apps bus as this app (user = app id, password = app key)
+        # when core told us where it is; the configured URL + site token
+        # otherwise (older core / bare dev).
+        connect_kwargs.update(bus_connection(
+            getattr(self, "credentials", None),
+            getattr(self.cfg, "nats_url", None),
+            getattr(self.cfg, "nats_token", None)))
+        logger.info("joining NATS at %s as %s",
+                    connect_kwargs.get("servers"),
+                    connect_kwargs.get("user") or ("site token" if connect_kwargs.get("token") else "anonymous"))
         self._nc = await nats.connect(**connect_kwargs)
+        subjects = self._nats_subjects()
         logger.info(
             "%s started: subject=%r",
             self.manifest.id if self.manifest else type(self).__name__,
-            self.cfg.subject_pattern,
+            subjects[0] if len(subjects) == 1 else subjects,
         )
         try:
-            sub = await self._nc.subscribe(self.cfg.subject_pattern)
-            async for msg in sub.messages:
+            # One queue, N subscriptions: every subject's messages are
+            # funnelled through the same handler in arrival order.
+            queue: asyncio.Queue = asyncio.Queue()
+            subs = [await self._nc.subscribe(subject, cb=queue.put)
+                    for subject in subjects]
+            while True:
+                msg = await queue.get()
                 # ``_handle_raw`` is sync on the stock archetypes, but
                 # apps with async sinks (the home-assistant-relay's
                 # publishers are awaitable) may override it as a
@@ -84,6 +104,11 @@ class NatsSubscriberMixin:
                 if self._stop_event.is_set():
                     break
         finally:
+            for sub in locals().get("subs", []) or []:
+                try:
+                    await sub.unsubscribe()
+                except Exception:  # noqa: BLE001
+                    pass
             try:
                 await self._nc.drain()
             except Exception:

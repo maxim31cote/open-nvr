@@ -151,13 +151,51 @@ def test_assignment_scope_via_sdk(monkeypatch):
     assert len(alerter.handle_event(_envelope(camera="cam-7"))) == 1
 
 
+def test_no_assigned_camera_means_no_alert_anywhere(monkeypatch):
+    """Closed by default: core answering "nobody carries this skill" is a
+    real scope of nothing, not "no restriction declared". An app nobody
+    pointed at a camera must not alert on the whole fleet."""
+    alerter, _ = _alerter(opennvr_url="http://core:8000")
+    monkeypatch.setattr(lpr, "cameras_for_skill",
+                        lambda url, skill, api_key=None: [])
+    assert alerter.handle_event(_envelope(camera="cam-1")) == []
+    assert alerter.handle_event(_envelope(camera="cam-7")) == []
+
+
 def test_scope_fetch_failure_means_no_restriction(monkeypatch):
     alerter, _ = _alerter(opennvr_url="http://core:8000")
 
     def boom(url, skill, api_key=None):
         raise RuntimeError("core down")
     monkeypatch.setattr(lpr, "cameras_for_skill", boom)
+    # Unknown, not empty: core could not be asked, so the previous
+    # answer stands. There is none yet at boot, so nothing is narrowed —
+    # an outage must not silently mute every alert either.
     assert len(alerter.handle_event(_envelope(camera="anything"))) == 1
+
+
+# ── Camera names in alert text ──────────────────────────────────────
+
+
+def test_alert_text_names_the_camera_not_its_handle(monkeypatch):
+    """A person reads the description — inbox, SMS, spoken relay — and
+    knows the camera as "Gate IN", not "cam7". The handle stays in
+    camera_id, where machines route on it. An explicit scope never asks
+    core for the roster, so the names must not ride on that fetch."""
+    alerter, _ = _alerter(opennvr_url="http://core:8000", cameras=["cam7"])
+    monkeypatch.setattr(lpr, "discover_cameras", lambda url, api_key=None: [
+        {"camera_id": "cam7", "name": "Gate IN"}])
+    fired = alerter.handle_event(_envelope(camera="cam7"))
+    assert "read on camera Gate IN " in fired[0].description
+    assert "cam7" not in fired[0].description
+    assert fired[0].camera_id == "cam7"
+
+
+def test_alert_text_falls_back_to_the_handle_when_core_cannot_say():
+    # conftest's roster stub answers [] — core could not be asked.
+    alerter, _ = _alerter(opennvr_url="http://core:8000", cameras=["cam7"])
+    fired = alerter.handle_event(_envelope(camera="cam7"))
+    assert "read on camera cam7 " in fired[0].description
 
 
 # ── Contract surface ────────────────────────────────────────────────

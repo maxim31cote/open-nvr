@@ -104,7 +104,9 @@ from sqlalchemy import create_engine  # noqa: E402
 from sqlalchemy.orm import sessionmaker  # noqa: E402
 from sqlalchemy.pool import StaticPool  # noqa: E402
 
-from core.auth import create_access_token, get_current_active_user  # noqa: E402
+from core.auth import (  # noqa: E402
+    create_access_token, get_current_active_user, get_current_superuser,
+)
 from core.database import Base, get_db  # noqa: E402
 from models import AuditLog, InstalledApp, Role, User  # noqa: E402
 from routers import apps as apps_router  # noqa: E402
@@ -116,10 +118,12 @@ from routers.apps import (  # noqa: E402
 
 
 class _StubUser:
-    """Just enough of a User for the router + audit log."""
+    """Just enough of a User for the router + audit log. A superuser:
+    camera scoping has its own module (test_apps_camera_scope)."""
 
     id = 1
     username = "tester"
+    is_superuser = True
 
 
 def _make_app():
@@ -166,6 +170,7 @@ def client():
     re-proven per route."""
     app, _session_factory, engine = _make_app()
     app.dependency_overrides[get_current_active_user] = lambda: _StubUser()
+    app.dependency_overrides[get_current_superuser] = lambda: _StubUser()
     app.dependency_overrides[get_register_principal] = lambda: _StubUser()
     app.dependency_overrides[get_read_principal] = lambda: _StubUser()
 
@@ -199,6 +204,7 @@ def auth_client(monkeypatch):
     app, session_factory, engine = _make_app()
     # Operator routes stay overridden — only registration auth is real.
     app.dependency_overrides[get_current_active_user] = lambda: _StubUser()
+    app.dependency_overrides[get_current_superuser] = lambda: _StubUser()
 
     session = session_factory()
     role = Role(name="admin")
@@ -784,11 +790,219 @@ def test_status_healthy_app_proxies_health_and_state(client, monkeypatch):
     assert resp.status_code == 200
     body = resp.json()
     assert body["health"]["ready"] is True
+    # The SDK's health_snapshot() never sets `status`, so core normalises
+    # its own verdict onto the payload. Without this the catalog chip read
+    # health["status"], found nothing, and rendered every SDK-built app
+    # "unknown" — a healthy app could not show healthy.
+    assert body["health"]["status"] == "ok"
     assert body["state"] == {"active_tracks": 2}
 
     row = client.get("/apps").json()[0]
     assert row["status"] == "ok"
     assert row["last_seen"] is not None
+
+
+def test_status_not_ready_app_reports_degraded(client, monkeypatch):
+    """Reachable but ready=false is 'degraded' — distinct from the
+    unreachable case, so an operator can tell 'starting up / broken
+    inside' from 'nothing is listening'."""
+
+    class _Resp:
+        def __init__(self, payload):
+            self._payload = payload
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return self._payload
+
+    class _NotReadyClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def get(self, url):
+            if url.endswith("/health"):
+                return _Resp({"ready": False, "uptime_s": 1})
+            return _Resp({})
+
+    _register(client)
+    monkeypatch.setattr(apps_router.httpx, "AsyncClient", _NotReadyClient)
+
+    body = client.get("/apps/loitering-detection/status").json()
+    assert body["health"]["status"] == "degraded"
+    assert client.get("/apps").json()[0]["status"] == "unreachable"
+
+
+def test_status_app_declaring_its_own_status_is_left_alone(client, monkeypatch):
+    """A hand-written app (the camera-agent) that already emits a status
+    string keeps it — core normalises only when the field is missing."""
+
+    class _Resp:
+        def __init__(self, payload):
+            self._payload = payload
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return self._payload
+
+    class _OwnStatusClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def get(self, url):
+            if url.endswith("/health"):
+                return _Resp({"status": "starting", "ready": True})
+            return _Resp({})
+
+    _register(client)
+    monkeypatch.setattr(apps_router.httpx, "AsyncClient", _OwnStatusClient)
+
+    body = client.get("/apps/loitering-detection/status").json()
+    assert body["health"]["status"] == "starting"
+
+
+def test_status_non_object_health_does_not_500(client, monkeypatch):
+    """An app answering 200 with a non-object body must not crash the
+    probe — the dict access behind `ready` would raise otherwise."""
+
+    class _Resp:
+        def __init__(self, payload):
+            self._payload = payload
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return self._payload
+
+    class _ListClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def get(self, url):
+            if url.endswith("/health"):
+                return _Resp(["not", "an", "object"])
+            return _Resp({})
+
+    _register(client)
+    monkeypatch.setattr(apps_router.httpx, "AsyncClient", _ListClient)
+
+    resp = client.get("/apps/loitering-detection/status")
+    assert resp.status_code == 200
+    assert resp.json()["health"]["body"] == ["not", "an", "object"]
+
+
+def _seen(client, app_id="loitering-detection"):
+    """last_seen for one row, as an aware datetime."""
+    from datetime import UTC, datetime
+
+    row = next(r for r in client.get("/apps").json() if r["id"] == app_id)
+    dt = datetime.fromisoformat(str(row["last_seen"]))
+    return dt if dt.tzinfo else dt.replace(tzinfo=UTC)
+
+
+def _backdate_last_seen(client, *, hours):
+    """Age every row's last_seen, so a heartbeat is unmistakable."""
+    from datetime import UTC, datetime, timedelta
+
+    from core.database import get_db
+    from models import InstalledApp
+
+    db = next(client.app.dependency_overrides[get_db]())
+    try:
+        for row in db.query(InstalledApp).all():
+            row.last_seen = datetime.now(UTC) - timedelta(hours=hours)
+        db.commit()
+    finally:
+        db.close()
+
+
+def test_config_poll_from_the_app_is_a_heartbeat(client):
+    """The SDK polls GET /{id}/config every ~10s from the running app.
+    That is the platform's best liveness signal and core used to discard
+    it, so `last_seen` froze at boot and the skill badge decayed to
+    "no recent contact" for an app that had been talking to us all
+    along."""
+    from datetime import UTC, datetime, timedelta
+
+    from services.app_keys import AppPrincipal
+
+    _register(client)
+    # Age the row past every freshness window.
+    _backdate_last_seen(client, hours=3)
+    assert datetime.now(UTC) - _seen(client) > timedelta(hours=2)
+
+    client.app.dependency_overrides[apps_router.get_read_principal] = (
+        lambda: AppPrincipal(app_id="loitering-detection")
+    )
+    assert client.get("/apps/loitering-detection/config").status_code == 200
+
+    client.app.dependency_overrides[apps_router.get_read_principal] = (
+        lambda: _StubUser()
+    )
+    assert datetime.now(UTC) - _seen(client) < timedelta(minutes=1)
+
+
+def test_config_poll_by_a_user_is_not_a_heartbeat(client):
+    """A person opening the config form says nothing about whether the
+    app process is alive — only the app's own key refreshes last_seen.
+    The site's internal key is held by companion services too, so it
+    must not count either."""
+    from datetime import UTC, datetime, timedelta
+
+    _register(client)
+    _backdate_last_seen(client, hours=3)
+
+    # The default override IS a user principal.
+    assert client.get("/apps/loitering-detection/config").status_code == 200
+    assert datetime.now(UTC) - _seen(client) > timedelta(hours=2)
+
+    # And the bare internal-key path (principal None) is not a heartbeat.
+    client.app.dependency_overrides[apps_router.get_read_principal] = (
+        lambda: None
+    )
+    assert client.get("/apps/loitering-detection/config").status_code == 200
+    client.app.dependency_overrides[apps_router.get_read_principal] = (
+        lambda: _StubUser()
+    )
+    assert datetime.now(UTC) - _seen(client) > timedelta(hours=2)
+
+
+def test_another_apps_key_is_not_a_heartbeat(client):
+    """An app key may only touch its own row (_own_app_only), so it can
+    never refresh someone else's liveness."""
+    from services.app_keys import AppPrincipal
+
+    _register(client)
+    client.app.dependency_overrides[apps_router.get_read_principal] = (
+        lambda: AppPrincipal(app_id="some-other-app")
+    )
+    resp = client.get("/apps/loitering-detection/config")
+    client.app.dependency_overrides[apps_router.get_read_principal] = (
+        lambda: _StubUser()
+    )
+    assert resp.status_code == 403
 
 
 def test_status_unknown_app_is_404(client):
@@ -877,10 +1091,31 @@ def test_validate_type_checks_primitives():
 
 
 def test_validate_geometry_passthrough():
-    """Dotted types are list-shaped on the wire; no deep validation."""
+    """Geometry types are checked for the shape the editor writes and
+    the SDK reads — a polygon is a list of [x, y] points (any count:
+    the editor saves mid-draw), a tripwire is {a, b, count_direction}."""
     manifest = {"params": [_param("zone", "geometry.polygon")]}
     assert validate_app_config(manifest, {"zone": [[0, 0], [1, 1], [1, 0]]}) == []
+    assert validate_app_config(manifest, {"zone": [[0.2, 0.3]]}) == []       # mid-draw
+    assert validate_app_config(manifest, {"zone": []}) == []                  # cleared
     assert validate_app_config(manifest, {"zone": "not-a-list"}) != []
+    assert validate_app_config(manifest, {"zone": [[0, 0], "x"]}) != []
+
+
+def test_validate_tripwire_is_a_dict_not_a_list():
+    """The occupancy app's entry_line: the catalog editor writes
+    {a, b, count_direction} per camera; the old validator demanded a
+    list for every dotted type and rejected every tripwire ever drawn
+    ("must be of type geometry.tripwire")."""
+    manifest = {"params": [_param("entry_line", "geometry.tripwire", per_camera=True)]}
+    wire = {"a": [0.3, 0.4], "b": [0.5, 0.4], "count_direction": "both"}
+    assert validate_app_config(manifest, {"entry_line": {"1": wire}}) == []
+    assert validate_app_config(manifest, {"entry_line": {"1": {**wire, "count_direction": "a_to_b"}}}) == []
+    assert validate_app_config(manifest, {"entry_line": {"1": {"a": [0.3, 0.4], "b": [0.5, 0.4]}}}) == []
+    assert validate_app_config(manifest, {"entry_line": {"1": None}}) == []          # cleared
+    assert validate_app_config(manifest, {"entry_line": {"1": [[0, 0], [1, 1]]}}) != []   # a list is not a wire
+    assert validate_app_config(manifest, {"entry_line": {"1": {"a": [0.3], "b": [0.5, 0.4]}}}) != []
+    assert validate_app_config(manifest, {"entry_line": {"1": {**wire, "count_direction": "up"}}}) != []
 
 
 def test_validate_per_camera_requires_dict_of_typed_values():

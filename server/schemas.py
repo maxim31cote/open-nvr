@@ -186,6 +186,11 @@ class UserCreate(UserBase):
 
     password: str = Field(..., min_length=8)
     role_id: int
+    # Only ``POST /users`` (superuser) honours this; self-registration
+    # never passes it. A superuser holds every permission and sees every
+    # camera, so minting one is the most privileged write in the API —
+    # the route requires the caller's current TOTP code for it.
+    is_superuser: bool = False
 
     @field_validator("password")
     @classmethod
@@ -361,6 +366,11 @@ class UserUpdate(BaseModel):
     last_name: str | None = Field(None, max_length=50)
     is_active: bool | None = None
     role_id: int | None = None
+    # Promote/demote. Superuser-only route; changing it requires the
+    # caller's TOTP code (X-MFA-Code) like delete/reactivate, and the
+    # last active superuser can never be demoted (nor can you demote
+    # yourself) — a site with no superuser has no way back.
+    is_superuser: bool | None = None
 
 
 class CameraAssignment(BaseModel):
@@ -548,6 +558,17 @@ class RolePermissionsSet(BaseModel):
     permission_ids: list[int]
 
 
+class CameraPermissionEntry(BaseModel):
+    """One row of ``GET /cameras/{id}/permissions``: a grant, or the
+    owner (who holds every right implicitly)."""
+
+    user_id: int
+    username: str | None = None
+    can_view: bool
+    can_manage: bool
+    is_owner: bool = False
+
+
 class CameraPermissionResponse(BaseModel):
     """Schema for camera permission response."""
 
@@ -653,14 +674,18 @@ class FirstTimeSetupResponse(BaseModel):
 class FirstTimeSetupCheckResponse(BaseModel):
     setup_required: bool
     username: str | None = None
+    # Whether ``POST /auth/register`` (self-service viewer accounts) is
+    # open on this deployment — the login page shows the link only then.
+    registration_open: bool = False
 
 
 class CameraResponse(CameraBase):
     id: int
     owner_id: int
     is_active: bool
-    # Per-camera capability assignment; None and [] both mean "nothing
-    # assigned" (read as: no restriction declared).
+    # Per-camera capability assignment. None and [] both mean "nothing
+    # assigned": eligible for any skill's picker, adopted by none, so no
+    # app inference runs on it. The UI reads eligibility off this.
     assignments: list[CameraAssignment] | None = None
     deleted_at: datetime | None = None
     created_at: datetime

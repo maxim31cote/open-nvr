@@ -79,6 +79,53 @@ llm_model: qwen2.5:1.5b
 llm_temperature: 0.4
 llm_max_tokens: 256
 
+# ── Turn-taking ───────────────────────────────────────────────────
+# Silero VAD opens a turn; Smart Turn v3 (Pipecat's semantic end-of-turn
+# model, bundled, CPU) closes it — a pause mid-sentence no longer ends
+# the turn. The VAD stop window is short on purpose (the model judges
+# the pause). Raise turn_stop_secs on slow speakers; lower it for snappier
+# replies at the cost of occasional early cut-offs.
+vad_confidence: 0.55
+vad_start_secs: 0.15
+vad_stop_secs: 0.2
+turn_stop_secs: 2.0
+# Smart Turn only ever looks at the last 8 s of a turn; buffering more is
+# pure cost.
+turn_max_secs: 8.0
+# Hardware fit (see MODELS_AND_LATENCY.md → "Turn detection on CPU").
+#   turn_detector: auto | smart | timer — auto runs Smart Turn v3 whenever
+#     this process has ≥2 cores and falls back to a plain silence timer
+#     (turn_timer_secs, no model) on a single core.
+#   turn_cpu_threads: onnxruntime threads for one verdict; leave unset for
+#     auto (1 thread — measured fastest up to 7 cores — 2 from 8 cores).
+turn_detector: auto
+# Interruptions on the streaming (/ws) pipeline — like a person's. While the
+# agent speaks, only a phrase that is real speech of ≥ interrupt_min_ms,
+# holds ≥ interrupt_min_words words once backchannels ("mm-hm", "okay") are
+# stripped, and reads as said TO the agent (its name, a question, a
+# request or correction, the site's own words — cameras, gate, plate…)
+# cuts it off; a cough, "yeah", or a remark to someone else does not.
+# GET /interruptions lists every decision with its reason — tune from that.
+#   interruptions: gated (default) | eager (any speech interrupts) | off
+interruptions: gated
+interrupt_min_ms: 300
+interrupt_min_words: 2
+interrupt_addressee: true
+# Thinking aloud: when a voice question needs a slow tool, the agent says
+# what it is about to do while it does it — "Let me check the gate camera
+# for vehicles between 2 and 3" — built from the tool call's own arguments
+# (no LLM), Piper-synthesised in parallel with the tool and cached by
+# text, at most once per turn, and only when the expected wait (this
+# site's own recent stage timings) is at least filler_min_ms. Typed
+# questions get the line as a status only. GET /thinking-aloud shows the
+# decisions. filler_source "model" asks the LLM to write the line in the
+# same first pass (a few extra tokens) with the template as fallback.
+thinking_aloud: true
+filler_min_ms: 1500
+filler_source: template
+# turn_cpu_threads: 1
+# turn_timer_secs: 0.8
+
 # How long Ollama keeps the model resident. Sent on every request, so a
 # host-run `ollama serve` stays warm even without OLLAMA_KEEP_ALIVE in its
 # environment — no turn pays a cold reload + full re-prefill. -1 = forever
@@ -193,6 +240,13 @@ event_ring_size: 256
 # your reverse proxy; localhost only by default.
 host: 127.0.0.1
 port: 9100
+# agent_contract_url — the base URL OpenNVR core reaches THIS agent at,
+# registered with the App Catalog as the agent's contract URL (core probes
+# <url>/health and <url>/state from there). Under compose it is the
+# service name, https://camera-agent:9100 (in the TLS certificate's SAN);
+# on a bare host, wherever core can reach this process. Unset = this
+# machine's hostname on `port`.
+# agent_contract_url: http://127.0.0.1:9100
 
 # Cameras the agent knows about. Each entry contributes a sentence
 # to the LLM's system prompt ("front-porch is the main entrance...")
@@ -245,6 +299,16 @@ system_prompt: |
 #   - camera_id: front-porch
 #     frame_url: http://192.168.1.50/cgi-bin/snapshot.cgi
 #     opennvr_camera_id: 3
+
+# Which alerts relayed from INSTALLED APPS the voice UI speaks aloud. They
+# always land in the feed with a chime; this only decides narration:
+#   important — high & critical only (default: a plate reader's every read
+#               is shown, not read out loud)
+#   all       — every app alert
+#   none      — never speak app alerts
+# The operator can change it live (Automations → ⚙); that choice persists
+# in the state file and wins over this value.
+announce_app_alerts: important
 
 # Per-site alert-level defaults by target (merged over the built-ins:
 # fire/smoke/flame/gas → siren). Levels: siren = CRITICAL, rings until

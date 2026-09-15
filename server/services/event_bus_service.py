@@ -59,6 +59,11 @@ EVENT_INFERENCE_ERROR = "inference_error"
 EVENT_CAMERA_EVENT = "camera_event"
 EVENT_CAMERA_STATUS = "camera_status"
 EVENT_SYSTEM_ALERT = "system_alert"
+# Live Tier-0 tracks for the detection overlay. Its own type, not
+# inference_result: that type is keyed on model_id and drives the
+# AI Detection Results table, and 5 fps of tracker output per camera
+# would flood it. Consumers that want boxes opt in by name.
+EVENT_TRACKS = "tracks"
 
 # Reasonable default for a single slow WebSocket client. Bumping this trades
 # memory for tolerance of bursty traffic.
@@ -68,21 +73,40 @@ _DEFAULT_SUBSCRIBER_QUEUE_SIZE = 100
 class _Subscriber:
     """One subscription slot. Owns the queue and the optional filters."""
 
-    __slots__ = ("queue", "camera_id", "tasks", "dropped", "created_at")
+    __slots__ = ("queue", "camera_id", "tasks", "allowed_camera_ids",
+                 "dropped", "created_at")
 
     def __init__(
         self,
         queue_size: int,
         camera_id: int | None,
         tasks: frozenset[str] | None,
+        allowed_camera_ids: frozenset[int] | None = None,
     ):
         self.queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=queue_size)
         self.camera_id = camera_id
         self.tasks = tasks
+        #: Cameras this subscriber is ENTITLED to, or ``None`` for
+        #: unrestricted (a superuser, or an internal caller that has
+        #: already done its own authorization).
+        #:
+        #: This is an authorization boundary, not a filter, and it lives
+        #: here rather than in the route on purpose: ``camera_id`` below
+        #: is a client-supplied preference and omitting it used to mean
+        #: "every camera". Enforcing entitlement in the same place the
+        #: event is matched means no present or future caller can widen
+        #: its own scope by leaving a query parameter off.
+        self.allowed_camera_ids = allowed_camera_ids
         self.dropped: int = 0
         self.created_at = time.time()
 
     def matches(self, event: dict[str, Any]) -> bool:
+        # Entitlement first: a subscriber never sees a camera it was not
+        # granted, whatever it asked to filter on.
+        if self.allowed_camera_ids is not None:
+            cam = event.get("camera_id")
+            if cam is None or cam not in self.allowed_camera_ids:
+                return False
         if self.camera_id is not None and event.get("camera_id") != self.camera_id:
             return False
         if self.tasks is not None and event.get("task") not in self.tasks:
@@ -142,6 +166,7 @@ class EventBus:
         self,
         camera_id: int | None = None,
         tasks: list[str] | None = None,
+        allowed_camera_ids: set[int] | frozenset[int] | None = None,
     ) -> AsyncIterator[_Subscriber]:
         """
         Context-managed subscription. Use as::
@@ -159,6 +184,9 @@ class EventBus:
             queue_size=self._subscriber_queue_size,
             camera_id=camera_id,
             tasks=frozenset(tasks) if tasks else None,
+            allowed_camera_ids=(
+                None if allowed_camera_ids is None
+                else frozenset(allowed_camera_ids)),
         )
         async with self._lock:
             self._subscribers.add(sub)
@@ -210,6 +238,27 @@ async def publish_inference_result(
         "event_type": EVENT_INFERENCE_RESULT,
         "camera_id": camera_id,
         "model_id": model_id,
+        "task": task,
+        "payload": payload,
+    })
+
+
+async def publish_tracks(
+    *,
+    camera_id: int,
+    payload: dict[str, Any],
+    task: str = "tier0",
+) -> None:
+    """Publish one frame's worth of Tier-0 tracks (normalized boxes, see
+    services/tier0_track_consumer.py) for live overlays. Carries a
+    camera_id, so it is subject to the per-camera entitlement the bus
+    enforces — a viewer never receives boxes for a camera they cannot
+    see, exactly as with the video itself."""
+    await get_event_bus().publish({
+        "event_type": EVENT_TRACKS,
+        "camera_id": camera_id,
+        # "tier0" for the platform detector, "overlay" for an app's boxes —
+        # the WS task filter lets a client take either or both.
         "task": task,
         "payload": payload,
     })

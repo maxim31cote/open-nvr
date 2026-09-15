@@ -33,6 +33,24 @@ def _type_name(t: Any) -> str:
     return str(t)
 
 
+#: Manifest ``pricing`` values the catalog understands.
+#: The detection-label vocabulary the platform's Tier-0 detector and the
+#: stock object-detection adapters emit (COCO-80). Apps that take a
+#: ``watch_labels`` list offer these as suggestions; operators can still
+#: type any label a custom model advertises.
+DETECTION_LABELS: tuple[str, ...] = (
+    "person", "bicycle", "car", "motorcycle", "bus", "truck", "boat", "train",
+    "airplane", "traffic light", "fire hydrant", "stop sign", "bench",
+    "backpack", "umbrella", "handbag", "suitcase", "dog", "cat", "bird",
+    "horse", "sheep", "cow", "elephant", "bear", "zebra", "giraffe",
+    "bottle", "cup", "knife", "laptop", "cell phone", "chair", "couch",
+    "potted plant", "bed", "dining table", "tv", "book", "clock",
+)
+
+PRICING_MODELS = frozenset({"free", "paid", "subscription", "contact"})
+#: Manifest ``entitlement`` values: how enabling is gated.
+ENTITLEMENT_MODES = frozenset({"none", "license_key"})
+
 @dataclass
 class Param:
     """One typed, declarative config knob.
@@ -48,9 +66,13 @@ class Param:
     # Required params have no usable default; the future PUT /config
     # validator and the catalog form both need the distinction.
     required: bool = False
+    # Values the catalog offers as one-click chips for a ``list`` (or
+    # ``str``) param — a detection-label vocabulary, plate formats, …
+    # Advisory: the operator may still type anything.
+    suggestions: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        out = {
             "name": self.name,
             "required": self.required,
             "type": _type_name(self.type),
@@ -58,6 +80,9 @@ class Param:
             "per_camera": self.per_camera,
             "description": self.description,
         }
+        if self.suggestions:
+            out["suggestions"] = [str(s) for s in self.suggestions]
+        return out
 
 
 @dataclass
@@ -210,6 +235,11 @@ class AppManifest:
     # this app's GET /state payload. Empty ⇒ the catalog shows raw
     # state JSON as before.
     state_schema: list[StateView] = field(default_factory=list)
+    # Declares that this app publishes overlay.boxes.v1 (boxes to draw
+    # over the live video). Informational: the catalog shows an Overlay
+    # switch for apps that declare it. The switch, not the flag, decides
+    # whether anything is drawn — that is the operator's, per app.
+    overlay: bool = False
     # Declarative operator actions (optional) — verbs the catalog can
     # invoke on the app's contract surface via the server's JWT-only
     # proxy. Empty ⇒ no Actions section renders.
@@ -251,7 +281,28 @@ class AppManifest:
     # as a "contact" action. Empty = no contact surface shown.
     contact: str = ""
 
+    # ── Commerce (the catalog's pricing badge and the licence gate) ─
+    # ``pricing``: "free" (default) | "paid" | "subscription" | "contact".
+    # ``price_note``: the human line under the badge — "$29 / camera /
+    # year", "free for 2 cameras". ``entitlement``: how the platform
+    # decides the app may be enabled — "none" (default: always) or
+    # "license_key": an administrator enters a key in the catalog, core
+    # asks the app to verify it (``ContractMixin.verify_license``) and
+    # refuses to enable the app until the app says the key is valid.
+    # The verdict is the app's — core stores the key (encrypted) and
+    # the verdict, and re-delivers both on the live config poll.
+    pricing: str = "free"
+    price_note: str = ""
+    entitlement: str = "none"
+
     def __post_init__(self) -> None:
+        if self.pricing not in PRICING_MODELS:
+            raise ValueError(
+                f"pricing must be one of {sorted(PRICING_MODELS)}, got {self.pricing!r}")
+        if self.entitlement not in ENTITLEMENT_MODES:
+            raise ValueError(
+                f"entitlement must be one of {sorted(ENTITLEMENT_MODES)}, "
+                f"got {self.entitlement!r}")
         if self.ui_mode not in ("internal", "external"):
             raise ValueError(
                 f"ui_mode must be 'internal' or 'external', got {self.ui_mode!r}"
@@ -280,6 +331,7 @@ class AppManifest:
             "emits": [a.to_dict() for a in self.emits],
             "state_schema": [v.to_dict() for v in self.state_schema],
             "actions": [a.to_dict() for a in self.actions],
+            "overlay": bool(self.overlay),
             "has_ui": bool(self.has_ui),
             "ui_mode": self.ui_mode,
             "ui_url": self.ui_url,
@@ -289,4 +341,7 @@ class AppManifest:
             "license": self.license,
             "use_cases": list(self.use_cases),
             "contact": self.contact,
+            "pricing": self.pricing,
+            "price_note": self.price_note,
+            "entitlement": self.entitlement,
         }

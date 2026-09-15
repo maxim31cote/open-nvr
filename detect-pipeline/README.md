@@ -265,8 +265,18 @@ DETECT_DECODE_FAST=false          # true = skip h264 loop filter (opt-in, not bi
 DETECT_DECODE_IDLE=nokey          # adaptive decode while quiet (dial 6, default on; none = off)
 DETECT_DECODE_IDLE_AFTER=60       # quiet seconds before a camera idles
 DETECT_STATIONARY_INTERVAL=10     # re-verify stationary tracks every Nth frame (0 = every frame)
+DETECT_MOTION_ENABLED=true        # false = motion gate OFF: detector runs on every frame (costly)
+DETECT_MOTION_THRESHOLD=30        # pixel-diff threshold 1-255 (raise on noisy sensors)
+DETECT_MOTION_CONTOUR_AREA=10     # min contour area counted as motion (raise to ignore small flicker)
+DETECT_MOTION_FRAME_ALPHA=0.01    # background adapt rate, steady state
+DETECT_MOTION_LIGHTNING_THRESHOLD=0.8  # frame fraction that re-triggers calibration (dawn/IR flash)
+DETECT_MOTION_CALIBRATION_MAX_FRAMES=150  # calibration deadline (#373): force the gate open after
+                                  # N consecutive calibrating frames (0 = old wedge-able behavior)
+DETECT_PLATE_CANDIDATES=4         # multi-frame OCR: plate-scored crops kept per vehicle track (LPR cameras)
+DETECT_PLATE_EARLY_ATTEMPTS=2     # OCR attempts fired while the car is still in frame (0 = ingest sweep only)
+DETECT_PLATE_CANDIDATE_GAP_S=0.75 # min seconds between retained candidates (diversity across the pass)
 DETECT_DETECTOR=onnx              # onnx (YOLOv8, default) | hog | blob | stub
-DETECT_ONNX_BACKEND=cvdnn         # cvdnn (zero-dep CPU, default) | ort (ONNX Runtime)
+DETECT_ONNX_BACKEND=auto          # auto (default: ort if installed, else cvdnn) | cvdnn | ort
 DETECT_ONNX_PROVIDERS=            # ort EPs, e.g. OpenVINOExecutionProvider (Intel N100)
 DETECT_HWACCEL=vaapi              # + uncomment devices: /dev/dri in compose
 DETECT_GATE_MODE=shadow           # shadow (default: measure only) | off | enforce (act) — see ENABLEMENT.md
@@ -274,8 +284,10 @@ DETECT_GATE_HEARTBEAT_S=0         # >0: force a periodic escalate even on static
 DETECT_GATE_CRITICAL_CLASSES=     # e.g. person,weapon — always escalate, bypass suppression
 DETECT_GATE_COOLDOWN_S=30         # re-escalate the same track at most once per N seconds
 DETECT_METRICS_PORT=9109          # Prometheus /metrics (0 to disable)
-DETECT_CV_THREADS=2               # cv2 intra-op thread cap (0 = uncapped); compose also
-                                  # exports OMP_NUM_THREADS with the same value
+DETECT_CV_THREADS=                # empty (default) = AUTO: cores / concurrent cameras,
+                                  # retuned as cameras come and go. An explicit value
+                                  # opts out of that and is never retuned; compose also
+                                  # exports OMP_NUM_THREADS from it
 DETECT_DISPATCH_KAIC_URL=         # set to enable Tier-1 dispatch (#10); empty = off
 DETECT_DISPATCH_TASK=caption      # default task for routed adapters
 # always_analyze is per-camera (gate config), deliberately not a global env.

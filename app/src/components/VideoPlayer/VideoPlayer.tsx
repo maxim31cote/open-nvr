@@ -32,7 +32,9 @@ import { displayAspect, isStretched, snapshotSize } from '../../lib/aspect'
 import type { AspectOverride } from '../../lib/aspect'
 import { useVideoSize } from '../../hooks/useVideoAspect'
 import { VideoControls } from './VideoControls'
+import { DetectionOverlay } from './DetectionOverlay'
 import { AlertCircle } from 'lucide-react'
+import { useTranslation } from '../../i18n'
 
 export type VideoPlayerMode = 'live' | 'playback'
 export type StreamType = 'webrtc' | 'hls' | 'mp4'
@@ -81,6 +83,11 @@ export interface VideoPlayerProps {
   /** Operator's per-camera display-aspect override ('auto' | 'native' | 'W:H').
       Absent or 'auto' runs the detection in lib/aspect.ts (issue #354). */
   displayAspectOverride?: AspectOverride | null
+  /** Core camera id — needed to subscribe this tile to its live tracks. */
+  cameraId?: number | null
+  /** Draw Tier-0 bounding boxes with label + score over the video.
+      Live mode only; costs nothing when false (no canvas, no socket). */
+  showDetections?: boolean
 }
 
 export interface VideoPlayerHandle {
@@ -115,9 +122,12 @@ export const VideoPlayer = forwardRef<VideoPlayerHandle, VideoPlayerProps>(
       ptzActive = false,
       overlay,
       displayAspectOverride,
+      cameraId = null,
+      showDetections = false,
     },
     ref
   ) {
+    const { t } = useTranslation()
     const containerRef = useRef<HTMLDivElement>(null)
     const videoRef = useRef<HTMLVideoElement>(null)
     const hlsInstanceRef = useRef<Hls | null>(null)
@@ -1081,12 +1091,20 @@ export const VideoPlayer = forwardRef<VideoPlayerHandle, VideoPlayerProps>(
           preload={mode === 'playback' ? 'metadata' : 'auto'}
         />
 
+        {/* Detection overlay — INSIDE the feed box so its rectangle is the
+            video's rectangle and normalized boxes need no letterbox math.
+            Below the loading/error overlays in the tree, so those still
+            cover it. Live only: recordings carry no live tracks. */}
+        {mode === 'live' && showDetections && cameraId != null && (
+          <DetectionOverlay cameraId={cameraId} />
+        )}
+
         {/* Loading / reconnecting overlay */}
         {(isLoading || isReconnecting) && (
           <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 bg-black/40">
             <div className="w-10 h-10 border-2 border-white/30 border-t-white rounded-full animate-spin" />
             {isReconnecting && (
-              <div className="text-xs text-white/80">Reconnecting…</div>
+              <div className="text-xs text-white/80">{t('video.reconnecting')}</div>
             )}
           </div>
         )}
@@ -1119,12 +1137,12 @@ export const VideoPlayer = forwardRef<VideoPlayerHandle, VideoPlayerProps>(
             <div className="relative z-10 flex flex-col items-center">
               <AlertCircle size={48} className="text-blue-200 mb-3" />
               <div className="text-lg font-medium text-white mb-1">{error}</div>
-              <div className="text-xs text-blue-200 mb-4">No signal detected</div>
+              <div className="text-xs text-blue-200 mb-4">{t('video.noSignal')}</div>
               <button
                 onClick={handleRefresh}
                 className="px-4 py-2 bg-blue-800/60 hover:bg-blue-700/60 border border-blue-500/50 rounded text-sm transition-colors"
               >
-                Retry Connection
+                {t('common.refresh')}
               </button>
             </div>
           </div>

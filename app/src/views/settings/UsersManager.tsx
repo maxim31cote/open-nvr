@@ -21,6 +21,7 @@ import { Trash2, UserCheck, UserPlus, UserCog, X } from 'lucide-react'
 import { apiService } from '../../lib/apiService'
 import { extractApiError } from '../../lib/apiError'
 import { useAuth } from '../../auth/AuthContext'
+import { useTranslation } from '../../i18n'
 
 type User = {
   id: number
@@ -41,6 +42,7 @@ type UserForm = {
   password?: string
   role_id: number
   is_active?: boolean
+  is_superuser?: boolean
 }
 
 type Role = {
@@ -50,6 +52,7 @@ type Role = {
 }
 
 export function UsersManager() {
+  const { t } = useTranslation()
   const { user: me } = useAuth()
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -67,7 +70,10 @@ export function UsersManager() {
   const [confirmAction, setConfirmAction] = useState<{ kind: 'delete' | 'activate'; user: User } | null>(null)
   const [mfaCode, setMfaCode] = useState('')
 
-  const [form, setForm] = useState<UserForm>({ username: '', email: '', password: '', role_id: 1, first_name: '', last_name: '' })
+  const [form, setForm] = useState<UserForm>({ username: '', email: '', password: '', role_id: 1, first_name: '', last_name: '', is_superuser: false })
+  // TOTP code for the MFA-gated writes inside the create/edit dialogs
+  // (creating a superuser, promoting or demoting one).
+  const [formMfaCode, setFormMfaCode] = useState('')
   const [roles, setRoles] = useState<Role[]>([])
 
   const canAdmin = !!me?.is_superuser
@@ -94,7 +100,7 @@ export function UsersManager() {
     })()
   }, [canAdmin, skip, limit, activeOnly])
 
-  const resetForm = () => setForm({ username: '', email: '', password: '', role_id: 1, first_name: '', last_name: '' })
+  const resetForm = () => { setForm({ username: '', email: '', password: '', role_id: 1, first_name: '', last_name: '', is_superuser: false }); setFormMfaCode('') }
 
   const onCreate = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -109,8 +115,9 @@ export function UsersManager() {
         first_name: form.first_name || null,
         last_name: form.last_name || null,
         is_active: true,
+        is_superuser: !!form.is_superuser,
       }
-      await apiService.createUser(payload)
+      await apiService.createUser(payload, form.is_superuser ? formMfaCode.trim() : undefined)
       setShowCreateDialog(false)
       resetForm()
       // refresh
@@ -138,9 +145,11 @@ export function UsersManager() {
         role_id: Number(form.role_id),
         is_active: form.is_active,
       }
+      const superuserChanged = !!form.is_superuser !== !!editing.is_superuser
+      if (superuserChanged) payload.is_superuser = !!form.is_superuser
       // Remove undefined fields
       Object.keys(payload).forEach((k) => payload[k] === undefined && delete payload[k])
-      await apiService.updateUser(editing.id, payload)
+      await apiService.updateUser(editing.id, payload, superuserChanged ? formMfaCode.trim() : undefined)
       setShowEditDialog(false)
       setEditing(null)
       resetForm()
@@ -188,12 +197,14 @@ export function UsersManager() {
       last_name: u.last_name || '',
       role_id: u.role_id,
       is_active: u.is_active,
+      is_superuser: u.is_superuser,
     })
+    setFormMfaCode('')
     setShowEditDialog(true)
   }
 
   if (!canAdmin) {
-    return <div className="text-sm text-amber-400">Admin only: you don’t have permission to manage users.</div>
+    return <div className="text-sm text-amber-400">{t('admin.only')}</div>
   }
 
   const totalPages = Math.max(1, Math.ceil(total / limit))
@@ -202,15 +213,15 @@ export function UsersManager() {
   return (
     <div className="space-y-3">
       <div className="flex items-center gap-2">
-        <h2 className="text-base font-semibold">Users</h2>
+        <h2 className="text-base font-semibold">{t('admin.users')}</h2>
         <div className="ml-auto flex items-center gap-2 text-sm">
           <label className="inline-flex items-center gap-1">
-            <input type="checkbox" className="accent-[var(--accent)]" checked={activeOnly} onChange={(e) => { setPage(1); setActiveOnly(e.target.checked) }} /> Active only
+            <input type="checkbox" className="accent-[var(--accent)]" checked={activeOnly} onChange={(e) => { setPage(1); setActiveOnly(e.target.checked) }} /> {t('admin.activeOnly')}
           </label>
           <select className="bg-[var(--panel-2)] border border-neutral-700 px-2 py-1" value={limit} onChange={(e) => { setPage(1); setLimit(Number(e.target.value)) }}>
             {[10, 20, 50].map(n => <option key={n} value={n}>{n}/page</option>)}
           </select>
-          <button className="px-2 py-1 bg-[var(--accent)] text-white rounded" onClick={() => { setShowCreateDialog(true); setEditing(null); resetForm(); setError(null) }}>Add User</button>
+          <button className="px-2 py-1 bg-[var(--accent)] text-white rounded" onClick={() => { setShowCreateDialog(true); setEditing(null); resetForm(); setError(null) }}>{t('admin.addUser')}</button>
         </div>
       </div>
 
@@ -223,7 +234,7 @@ export function UsersManager() {
             <div className="flex items-center justify-between p-4 border-b border-neutral-700">
               <h3 className="font-semibold flex items-center gap-2">
                 <UserPlus size={18} />
-                Add New User
+                {t('admin.addUser')}
               </h3>
               <button className="p-1 hover:bg-[var(--panel-2)] rounded" onClick={() => { setShowCreateDialog(false); resetForm(); setError(null) }}>
                 <X size={18} />
@@ -262,11 +273,20 @@ export function UsersManager() {
                       {roles.map(r => <option key={r.id} value={r.id}>{r.name}</option>)}
                     </select>
                   </label>
+                  <label className="flex items-center gap-2 mt-5 text-sm" title="A superuser holds every permission and sees every camera, regardless of role">
+                    <input type="checkbox" className="accent-[var(--accent)]" checked={!!form.is_superuser} onChange={(e) => setForm({ ...form, is_superuser: e.target.checked })} /> Superuser
+                  </label>
+                  {form.is_superuser && (
+                    <label className="flex flex-col gap-1">
+                      <span className="text-xs text-[var(--text-dim)]">Your MFA code * (required to create a superuser)</span>
+                      <input className="bg-[var(--bg-2)] border border-neutral-700 px-3 py-2 text-sm font-mono" inputMode="numeric" maxLength={6} value={formMfaCode} onChange={(e) => setFormMfaCode(e.target.value.replace(/\D/g, ''))} required />
+                    </label>
+                  )}
                 </div>
               </div>
               <div className="flex items-center justify-end gap-2 p-4 border-t border-neutral-700">
-                <button type="button" className="px-4 py-2 text-sm border border-neutral-600 hover:bg-[var(--panel-2)]" onClick={() => { setShowCreateDialog(false); resetForm(); setError(null) }}>Cancel</button>
-                <button type="submit" className="px-4 py-2 text-sm bg-[var(--accent)] text-white disabled:opacity-50" disabled={loading}>{loading ? 'Creating...' : 'Create User'}</button>
+                <button type="button" className="px-4 py-2 text-sm border border-neutral-600 hover:bg-[var(--panel-2)]" onClick={() => { setShowCreateDialog(false); resetForm(); setError(null) }}>{t('admin.cancel')}</button>
+                <button type="submit" className="px-4 py-2 text-sm bg-[var(--accent)] text-white disabled:opacity-50" disabled={loading || (!!form.is_superuser && formMfaCode.length !== 6)}>{loading ? t('common.loading') : t('admin.createUser')}</button>
               </div>
             </form>
           </div>
@@ -280,7 +300,7 @@ export function UsersManager() {
             <div className="flex items-center justify-between p-4 border-b border-neutral-700">
               <h3 className="font-semibold flex items-center gap-2">
                 <UserCog size={18} />
-                Edit User: {editing.username}
+                {t('admin.editUser')}: {editing.username}
               </h3>
               <button className="p-1 hover:bg-[var(--panel-2)] rounded" onClick={() => { setShowEditDialog(false); setEditing(null); resetForm(); setError(null) }}>
                 <X size={18} />
@@ -317,11 +337,20 @@ export function UsersManager() {
                   <label className="flex items-center gap-2 mt-5 text-sm" title={me?.id === editing.id ? 'You cannot deactivate your own account' : !editing.is_active ? 'Use the Activate button to reactivate (requires MFA code)' : undefined}>
                     <input type="checkbox" className="accent-[var(--accent)]" checked={!!form.is_active} onChange={(e) => setForm({ ...form, is_active: e.target.checked })} disabled={me?.id === editing.id || !editing.is_active} /> Active
                   </label>
+                  <label className="flex items-center gap-2 mt-5 text-sm" title={me?.id === editing.id ? 'You cannot change your own superuser status' : 'A superuser holds every permission and sees every camera, regardless of role'}>
+                    <input type="checkbox" className="accent-[var(--accent)]" checked={!!form.is_superuser} onChange={(e) => setForm({ ...form, is_superuser: e.target.checked })} disabled={me?.id === editing.id} /> Superuser
+                  </label>
+                  {!!form.is_superuser !== !!editing.is_superuser && (
+                    <label className="flex flex-col gap-1">
+                      <span className="text-xs text-[var(--text-dim)]">Your MFA code * (required to {form.is_superuser ? 'promote' : 'demote'})</span>
+                      <input className="bg-[var(--bg-2)] border border-neutral-700 px-3 py-2 text-sm font-mono" inputMode="numeric" maxLength={6} value={formMfaCode} onChange={(e) => setFormMfaCode(e.target.value.replace(/\D/g, ''))} required />
+                    </label>
+                  )}
                 </div>
               </div>
               <div className="flex items-center justify-end gap-2 p-4 border-t border-neutral-700">
-                <button type="button" className="px-4 py-2 text-sm border border-neutral-600 hover:bg-[var(--panel-2)]" onClick={() => { setShowEditDialog(false); setEditing(null); resetForm(); setError(null) }}>Cancel</button>
-                <button type="submit" className="px-4 py-2 text-sm bg-[var(--accent)] text-white disabled:opacity-50" disabled={loading}>{loading ? 'Updating...' : 'Update User'}</button>
+                <button type="button" className="px-4 py-2 text-sm border border-neutral-600 hover:bg-[var(--panel-2)]" onClick={() => { setShowEditDialog(false); setEditing(null); resetForm(); setError(null) }}>{t('admin.cancel')}</button>
+                <button type="submit" className="px-4 py-2 text-sm bg-[var(--accent)] text-white disabled:opacity-50" disabled={loading || (!!form.is_superuser !== !!editing.is_superuser && formMfaCode.length !== 6)}>{loading ? t('common.loading') : t('admin.updateUser')}</button>
               </div>
             </form>
           </div>
@@ -385,12 +414,12 @@ export function UsersManager() {
         <table className="w-full text-sm">
           <thead className="bg-[var(--panel-2)] text-left">
             <tr>
-              <th className="p-2">Username</th>
-              <th className="p-2">Email</th>
-              <th className="p-2">Role</th>
-              <th className="p-2">Active</th>
-              <th className="p-2">Superuser</th>
-              <th className="p-2">Actions</th>
+              <th className="p-2">{t('admin.username')}</th>
+              <th className="p-2">{t('admin.email')}</th>
+              <th className="p-2">{t('admin.role')}</th>
+              <th className="p-2">{t('admin.active')}</th>
+              <th className="p-2">{t('admin.superuser')}</th>
+              <th className="p-2">{t('admin.actions')}</th>
             </tr>
           </thead>
           <tbody>
@@ -401,25 +430,25 @@ export function UsersManager() {
                 <td className="p-2">{roles.find(r => r.id === u.role_id)?.name ?? u.role_id}</td>
                 <td className="p-2">
                   <span className={`inline-flex items-center text-xs px-2 py-0.5 rounded ${u.is_active ? 'bg-green-900/50 text-green-400' : 'bg-gray-800 text-gray-400'}`}>
-                    {u.is_active ? 'Active' : 'Inactive'}
+                    {u.is_active ? t('admin.active') : t('admin.inactive')}
                   </span>
                 </td>
-                <td className="p-2">{u.is_superuser ? 'Yes' : 'No'}</td>
+                <td className="p-2">{u.is_superuser ? t('common.yes') : t('common.no')}</td>
                 <td className="p-2 space-x-2">
-                  <button className="px-2 py-1 border border-neutral-700 bg-[var(--panel-2)]" onClick={() => startEdit(u)}>Edit</button>
+                  <button className="px-2 py-1 border border-neutral-700 bg-[var(--panel-2)]" onClick={() => startEdit(u)}>{t('admin.edit')}</button>
                   {u.is_active ? (
                     me?.id !== u.id && (
-                      <button className="px-2 py-1 border border-neutral-700 bg-[var(--panel-2)]" onClick={() => { setConfirmAction({ kind: 'delete', user: u }); setMfaCode(''); setError(null) }}>Delete</button>
+                      <button className="px-2 py-1 border border-neutral-700 bg-[var(--panel-2)]" onClick={() => { setConfirmAction({ kind: 'delete', user: u }); setMfaCode(''); setError(null) }}>{t('admin.delete')}</button>
                     )
                   ) : (
-                    <button className="px-2 py-1 border border-green-800 bg-green-900/30 text-green-400" onClick={() => { setConfirmAction({ kind: 'activate', user: u }); setMfaCode(''); setError(null) }}>Activate</button>
+                    <button className="px-2 py-1 border border-green-800 bg-green-900/30 text-green-400" onClick={() => { setConfirmAction({ kind: 'activate', user: u }); setMfaCode(''); setError(null) }}>{t('admin.activateUser')}</button>
                   )}
                 </td>
               </tr>
             ))}
             {users.length === 0 && (
               <tr>
-                <td colSpan={6} className="p-3 text-center text-[var(--text-dim)]">No users</td>
+                <td colSpan={6} className="p-3 text-center text-[var(--text-dim)]">{t('admin.noUsers')}</td>
               </tr>
             )}
           </tbody>
@@ -427,13 +456,13 @@ export function UsersManager() {
       </div>
 
       <div className="flex items-center gap-2 text-sm">
-        <button className="px-2 py-1 border border-neutral-700 bg-[var(--panel-2)]" disabled={page <= 1} onClick={() => setPage((p) => Math.max(1, p - 1))}>Prev</button>
+        <button className="px-2 py-1 border border-neutral-700 bg-[var(--panel-2)]" disabled={page <= 1} onClick={() => setPage((p) => Math.max(1, p - 1))}>{t('admin.previous')}</button>
         {activeOnly ? (
-          <span>Page {page}</span>
+          <span>{t('admin.page')} {page}</span>
         ) : (
-          <span>Page {page} / {totalPages}</span>
+          <span>{t('admin.page')} {page} / {totalPages}</span>
         )}
-        <button className="px-2 py-1 border border-neutral-700 bg-[var(--panel-2)]" disabled={activeOnly ? !hasNext : page >= totalPages} onClick={() => setPage((p) => p + 1)}>Next</button>
+        <button className="px-2 py-1 border border-neutral-700 bg-[var(--panel-2)]" disabled={activeOnly ? !hasNext : page >= totalPages} onClick={() => setPage((p) => p + 1)}>{t('admin.next')}</button>
       </div>
     </div>
   )

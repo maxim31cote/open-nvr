@@ -10,6 +10,7 @@ passwords or requiring an operator login token.
 
 from __future__ import annotations
 
+import asyncio
 import binascii
 import logging
 import secrets
@@ -21,8 +22,12 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from core.config import settings
-from core.database import get_db
+from core.database import get_db, release
 from models import Camera, SecuritySetting
+from services.app_keys import (
+    AppPrincipal, app_camera_ids, looks_like_app_key, resolve_app_key,
+)
+from services.skill_assignments import camera_adopted, camera_skills
 from services.stream_service import _build_stream_name
 
 logger = logging.getLogger(__name__)
@@ -33,8 +38,25 @@ router = APIRouter(prefix="/internal/camera-agent", tags=["internal-camera-agent
 def _require_internal_key(
     x_internal_api_key: str | None = Header(default=None, alias="X-Internal-Api-Key"),
     x_internal_api_key_alt: str | None = Header(default=None, alias="X-Internal-API-Key"),
-) -> None:
+    db: Session = Depends(get_db),
+):
+    """Authenticate an internal-door call.
+
+    Returns ``None`` for the deployment's ``INTERNAL_API_KEY`` (a platform
+    component — unscoped), or an :class:`services.app_keys.AppPrincipal`
+    for an app presenting its own key (``oak_…`` — scoped to the app's
+    camera roster on the read routes below, refused on the pipeline's
+    write routes). 401 otherwise.
+    """
     supplied = x_internal_api_key or x_internal_api_key_alt
+    if looks_like_app_key(supplied):
+        row = resolve_app_key(db, supplied)
+        if row is None:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="invalid or revoked app key",
+            )
+        return AppPrincipal(app_id=row.id)
     expected = settings.internal_api_key
     # Constant-time compare to avoid leaking the key via response timing.
     if not expected or not supplied or not secrets.compare_digest(str(supplied), str(expected)):
@@ -42,6 +64,28 @@ def _require_internal_key(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="invalid internal api key",
         )
+    return None
+
+
+def _platform_only(principal) -> None:
+    """The pipeline's write routes and platform config: site key only."""
+    if isinstance(principal, AppPrincipal):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="this route is for platform components, not apps",
+        )
+
+
+def _app_roster(db: Session, principal) -> set[int] | None:
+    """Camera ids an app principal may read (None = unrestricted)."""
+    if not isinstance(principal, AppPrincipal):
+        return None
+    from models import InstalledApp
+
+    row = db.query(InstalledApp).filter(InstalledApp.id == principal.app_id).first()
+    if row is None:
+        return set()
+    return app_camera_ids(db, row)
 
 
 class TrackEventIn(BaseModel):
@@ -57,13 +101,33 @@ class TrackEventIn(BaseModel):
     # Best-frame crop (JPEG, base64). Optional: a visit with no retained crop
     # is still history worth keeping.
     evidence_jpeg_b64: str | None = None
+    # Multi-frame OCR: up to a handful of plate-candidate crops (JPEG,
+    # base64), most promising first. Enrichment sweeps them in order —
+    # several diverse OCR attempts per vehicle instead of one.
+    candidate_jpegs_b64: list[str] | None = None
+    # Wall-clock capture time of each candidate above, same order. The
+    # winning read's stamp becomes the row's observed_at — the one time
+    # on a plate row that belongs to the vehicle the number came off.
+    # Ignored unless it lines up 1:1 with the crops: a short list would
+    # hand a read someone else's timestamp, which is worse than none.
+    candidate_ts: list[float] | None = None
+    # Capture time of ``evidence_jpeg_b64``. A visit from a camera without
+    # the LPR skill ships no candidates at all, so the sweep below reads
+    # the evidence crop — and until this arrived that read got no
+    # observed_at, which on a default install is EVERY read (#451).
+    evidence_ts: float | None = None
+    # The whole camera frame the best crop came from (JPEG, base64). The
+    # crop answers "what was it"; a 163x187 rectangle of knuckles cannot
+    # answer "where was it and what else was in shot". Optional, and DROPPED
+    # rather than 422'd when oversized or malformed — see the ingest below.
+    scene_jpeg_b64: str | None = None
 
 
 @router.post("/events", status_code=201)
 async def ingest_track_event(
     payload: TrackEventIn,
     background: BackgroundTasks,
-    _: None = Depends(_require_internal_key),
+    principal=Depends(_require_internal_key),
     db: Session = Depends(get_db),
 ):
     """Canonical-store ingest (RFC-0001 C1): persist a visit + its evidence.
@@ -73,6 +137,7 @@ async def ingest_track_event(
     content-addresses to the same file; duplicate rows are tolerated and
     cheap to de-dup at query time via (camera_id, track_id, started_at).
     """
+    _platform_only(principal)
     camera = db.query(Camera).filter(Camera.id == payload.camera_id).first()
     if camera is None:
         raise HTTPException(status_code=404, detail="unknown camera_id")
@@ -95,6 +160,32 @@ async def ingest_track_event(
         except (ValueError, binascii.Error) as e:
             raise HTTPException(status_code=422, detail=f"bad evidence: {e}")
 
+    scene_rel = None
+    if payload.scene_jpeg_b64:
+        # Aliased import on purpose: the `import base64` above is INSIDE the
+        # evidence branch, so it binds a function-local that does not exist
+        # on a scene-without-crop payload. The candidate block below dodges
+        # the same trap the same way.
+        import base64 as _b64s
+
+        from services.evidence_store import MAX_EVIDENCE_BYTES as _MAXS
+        from services.evidence_store import save_evidence_jpeg as _save_scene
+
+        # Drop the image, never the visit. The evidence branch above 422s,
+        # which raises BEFORE record_track_visit — correct for the primary
+        # photo, catastrophic for a garnish: one oversized scene frame would
+        # cost the visit its place in history.
+        if len(payload.scene_jpeg_b64) <= (_MAXS * 4) // 3 + 8:
+            try:
+                scene_rel = _save_scene(
+                    _b64s.b64decode(payload.scene_jpeg_b64, validate=True)
+                )
+            except (ValueError, binascii.Error):
+                logger.debug(
+                    "scene evidence rejected for camera %s", payload.camera_id,
+                    exc_info=True,
+                )
+
     from sqlalchemy.exc import IntegrityError
 
     from services.timeline_service import record_track_visit
@@ -110,6 +201,7 @@ async def ingest_track_event(
             track_id=payload.track_id,
             stationary=payload.stationary,
             evidence_path=evidence_rel,
+            scene_evidence_path=scene_rel,
         )
     except IntegrityError:
         # Retry raced an earlier success — the visit already exists
@@ -126,15 +218,298 @@ async def ingest_track_event(
             )
             .first()
         )
-        return {"id": existing.id if existing else None, "duplicate": True}
+        duplicate_id = existing.id if existing else None
+        # Same reason as the release below: this early return still has a
+        # background task ahead of it in the exit stack.
+        release(db)
+        return {"id": duplicate_id, "duplicate": True}
     # PR-C: vehicle visit with evidence -> queue ONE OCR pass over the best
     # frame (background — never on the ingest path). Best-effort: no adapter,
     # no plate, no problem.
-    from services.plate_enrichment import enrich_event_plate, wants_plate
+    from services.plate_enrichment import (
+        MAX_INGEST_ATTEMPTS, enrich_event_plate, wants_plate,
+    )
 
-    if wants_plate(row.label, evidence_rel, settings.events_plate_enrichment):
-        background.add_task(enrich_event_plate, row.id)
-    return {"id": row.id, "evidence_path": evidence_rel}
+    # Multi-frame OCR, latency half: an early attempt may already have
+    # read this vehicle's plate while it was still in frame — claim it
+    # (time-window checked; recycled track ids from a restarted worker
+    # fail the window and are ignored).
+    from services.plate_enrichment import VEHICLE_LABELS as _VEHICLES
+
+    # Duplicate-sighting dedup: a fragmented track re-reads the car we
+    # just read. When the claimed early read matches a plate seen on
+    # this camera within the rolling window, the sighting is FOLDED —
+    # no plate written AND no enrichment sweep queued (the identity is
+    # established; further OCR on this visit is pure waste).
+    plate_resolved_as_duplicate = False
+    early_read = False
+    if (row.label or "") in _VEHICLES \
+            and payload.track_id and not row.plate_text:
+        from services.plate_attempt_cache import cache as _attempt_cache
+        from services.plate_enrichment import (
+            dedup_window_s, is_duplicate_sighting, note_sighting,
+            observed_dt, stamp_plate_evidence,
+        )
+
+        pending = _attempt_cache.claim(
+            payload.camera_id, payload.track_id,
+            started_ts=payload.started_at.timestamp(),
+            ended_ts=(payload.ended_at or payload.started_at).timestamp(),
+        )
+        if pending is not None:
+            plate = pending.plate[:32]
+            if is_duplicate_sighting(payload.camera_id, plate):
+                note_sighting(payload.camera_id, plate)
+                plate_resolved_as_duplicate = True
+                logger.info(
+                    "plate ingest: event %s reads %s — seen on cam %s "
+                    "within %.0fs, sighting folded (no plate written)",
+                    row.id, plate, payload.camera_id, dedup_window_s(),
+                )
+            else:
+                row.plate_text = plate
+                # The attempt's own capture time — the frame this read
+                # came off, not this ingest. Tier-0 fires the attempt
+                # the moment the track confirms, which can be minutes
+                # before the visit closes and lands here.
+                row.observed_at = observed_dt(pending.attempt_ts)
+                # Marked as a SINGLE early look: the sweep below may
+                # confirm it (and say how many looks agree) or, when
+                # several later looks disagree, replace it.
+                stamp_plate_evidence(row, pending.plate_evidence_path,
+                                     frame_path=pending.plate_frame_path,
+                                     reads=1, source="early",
+                                     confidence=pending.confidence)
+                note_sighting(payload.camera_id, plate)
+                db.commit()
+                early_read = True
+                logger.info(
+                    "plate ingest: event %s -> %s (early attempt, conf=%.2f)",
+                    row.id, row.plate_text, pending.confidence,
+                )
+
+    # Multi-frame OCR, recall half: decode the candidate crops (bounded:
+    # same per-image cap as evidence, at most MAX_INGEST_ATTEMPTS) and
+    # hand them to the enrichment sweep. Bad candidates are dropped, not
+    # fatal — the visit itself is already persisted. An early read does
+    # NOT skip this any more: the candidates are the looks that confirm
+    # (or overturn) it — see plate_enrichment's consensus policy.
+    candidates: list[bytes] = []
+    candidate_stamps: list[float | None] = []
+    if payload.candidate_jpegs_b64 and (not row.plate_text or early_read) \
+            and not plate_resolved_as_duplicate:
+        import base64 as _b64
+
+        from services.evidence_store import MAX_EVIDENCE_BYTES as _MAX
+
+        # Zipped, not indexed: a crop that fails to decode must take its
+        # stamp out of the list with it, or every later read inherits the
+        # timestamp of a different look.
+        stamps = payload.candidate_ts or []
+        if len(stamps) != len(payload.candidate_jpegs_b64):
+            stamps = []                  # partial/absent -> no observed_at
+        # strict: both branches of the fallback above are exactly as long
+        # as the crop list, so this cannot raise today — it is here so a
+        # future edit that breaks that invariant fails loudly instead of
+        # silently dating reads by another look's clock.
+        paired = list(zip(
+            payload.candidate_jpegs_b64,
+            stamps or [None] * len(payload.candidate_jpegs_b64),
+            strict=True,
+        ))
+        for encoded, stamp in paired[:MAX_INGEST_ATTEMPTS]:
+            if not isinstance(encoded, str) \
+                    or len(encoded) > (_MAX * 4) // 3 + 8:
+                continue
+            try:
+                candidates.append(_b64.b64decode(encoded, validate=True))
+            except (ValueError, binascii.Error):
+                continue
+            candidate_stamps.append(
+                float(stamp) if isinstance(stamp, (int, float))
+                and not isinstance(stamp, bool) else None
+            )
+
+    # An early read is re-checked only against CANDIDATES (fresh looks);
+    # OCR-ing the evidence frame alone would be one more single look.
+    if ((not row.plate_text) or (early_read and candidates)) \
+            and not plate_resolved_as_duplicate \
+            and wants_plate(
+        row.label, evidence_rel or (candidates and "candidates"),
+        settings.events_plate_enrichment,
+        # The assignment gate. `camera` is already in hand from the
+        # existence check above, so this costs no extra query on the
+        # hot path — and without it every vehicle on every camera
+        # bought an OCR inference.
+        camera_skills(camera),
+    ):
+        # Registered BEFORE the task is queued: KAI-C republishes every
+        # accepted read this sweep makes as plate.recognized.v1, and the
+        # bus consumer must not race the sweep for its own row.
+        from services.plate_enrichment import mark_sweep_pending
+
+        mark_sweep_pending(row.id)
+        background.add_task(enrich_event_plate, row.id, candidates or None,
+                            candidate_stamps or None, payload.evidence_ts)
+    # Read the id BEFORE releasing: record_track_visit committed, which
+    # expires every attribute, so a post-close row.id would try to refresh a
+    # detached instance.
+    event_id = row.id
+    # Starlette runs BackgroundTasks inside Response.__call__ — still inside
+    # FastAPI's request exit stack — so without this the connection is pinned
+    # for the WHOLE OCR sweep queued above. At ~1 visit/sec that alone
+    # exhausted the pool, and plate reads stopped while events kept flowing.
+    release(db)
+    return {"id": event_id, "evidence_path": evidence_rel,
+            "scene_evidence_path": scene_rel}
+
+
+class PlateAttemptIn(BaseModel):
+    """One early OCR attempt from Tier-0 — a plate candidate crop for a
+    vehicle whose track just confirmed (multi-frame OCR, latency half)."""
+
+    camera_id: int
+    track_id: str
+    ts: float                    # wall-clock seconds of the attempt
+    jpeg_b64: str
+
+
+async def run_early_plate_attempt(
+    camera_id: int, track_id: str, ts: float, jpeg: bytes,
+) -> None:
+    """Background: OCR the early candidate; park an accepted read for
+    the visit to claim at ingest. If the visit ALREADY landed (the
+    attempt raced ingest, or core was slow), write the plate straight
+    onto the row instead — the cache is a waiting room, not a detour.
+
+    Best-effort everywhere: a failed early attempt costs latency only;
+    the ingest-time candidate sweep is the safety net."""
+    from services.plate_attempt_cache import cache as _attempt_cache
+    from services.plate_enrichment import _ocr_jpeg
+
+    read = await _ocr_jpeg(jpeg, f"cam{camera_id}")
+    if read is None or not read.get("accepted"):
+        return
+    # #382: this crop is the image the plate was READ from, and it is
+    # gone the moment this task returns. Store it ONCE here and carry
+    # the path — both the claim below and the ingest-time claim need it,
+    # and content-addressing makes a repeat store free anyway.
+    # #385: narrowed to the plate the adapter localised in THESE bytes;
+    # the attempt itself is a vehicle crop.
+    from services.plate_enrichment import store_plate_images
+
+    # Threaded for the same reason as the ingest sweep: a cv2 decode plus
+    # a file write has no business on the event loop. Both images in one
+    # hop — the uncropped attempt is the only picture guaranteed to show
+    # the car this plate came off, when a merged track makes the visit's
+    # own best frame a different vehicle.
+    plate_crop_rel, plate_frame_rel = await asyncio.to_thread(
+        store_plate_images, jpeg, read.get("box"))
+    _attempt_cache.put(
+        camera_id, track_id,
+        plate=read["plate"], confidence=read["confidence"], attempt_ts=ts,
+        plate_evidence_path=plate_crop_rel,
+        plate_frame_path=plate_frame_rel,
+    )
+    # Duplicate sighting (fragmented track re-reading the car we just
+    # read): still PARK the read — the ingest claim is what lets the
+    # visit skip its whole OCR sweep — but skip the race-cover row
+    # write; the claim path makes the fold decision with fresher state.
+    from services.plate_enrichment import (
+        is_duplicate_sighting, note_sighting, stamp_plate_evidence,
+    )
+
+    if is_duplicate_sighting(camera_id, read["plate"]):
+        note_sighting(camera_id, read["plate"])
+        return
+    # Race cover: visit already ingested and still unplated → apply now.
+    try:
+        from datetime import timedelta, timezone as _tz
+
+        from core.database import SessionLocal
+        from models import TimelineEvent
+
+        attempt_dt = datetime.fromtimestamp(ts, tz=_tz.utc)
+        db = SessionLocal()
+        try:
+            row = (
+                db.query(TimelineEvent)
+                .filter(
+                    TimelineEvent.camera_id == int(camera_id),
+                    TimelineEvent.track_id == str(track_id)[:40],
+                    TimelineEvent.plate_text.is_(None),
+                    TimelineEvent.started_at
+                    <= attempt_dt + timedelta(seconds=10),
+                )
+                .order_by(TimelineEvent.started_at.desc())
+                .first()
+            )
+            if row is not None and (
+                row.ended_at is None
+                or row.ended_at >= attempt_dt - timedelta(seconds=10)
+            ):
+                row.plate_text = read["plate"][:32]
+                # Same capture time the cache would have carried had the
+                # claim path won this race — the row must not read
+                # differently for having been ingested a moment earlier.
+                row.observed_at = attempt_dt
+                stamp_plate_evidence(row, plate_crop_rel,
+                                     frame_path=plate_frame_rel,
+                                     reads=1, source="early",
+                                     confidence=read["confidence"])
+                note_sighting(camera_id, row.plate_text)
+                db.commit()
+                logger.info(
+                    "plate attempt: event %s -> %s (raced ingest, conf=%.2f)",
+                    row.id, row.plate_text, read["confidence"],
+                )
+        finally:
+            db.close()
+    except Exception:
+        logger.debug("early plate attempt row-apply failed", exc_info=True)
+
+
+@router.post("/plates/attempt", status_code=202)
+async def ingest_plate_attempt(
+    payload: PlateAttemptIn,
+    background: BackgroundTasks,
+    principal=Depends(_require_internal_key),
+    db: Session = Depends(get_db),
+):
+    """Accept one early plate attempt (multi-frame OCR). The OCR runs
+    in the background — this endpoint only validates and queues, so the
+    Tier-0 poster thread never waits on an inference."""
+    _platform_only(principal)
+    camera = db.query(Camera).filter(Camera.id == payload.camera_id).first()
+    if camera is None:
+        raise HTTPException(status_code=404, detail="unknown camera_id")
+    if not settings.events_plate_enrichment:
+        return {"status": "disabled"}
+    # The same assignment gate the ingest sweep applies. Tier-0 already
+    # declines to POST here for an unassigned camera, so today this is
+    # belt and braces — but the endpoint is reachable by any platform
+    # key, and "no producer currently misuses it" is not a gate.
+    from services.plate_enrichment import PLATE_SKILL
+
+    if not camera_adopted(camera, PLATE_SKILL):
+        return {"status": "unassigned"}
+
+    from services.evidence_store import MAX_EVIDENCE_BYTES
+
+    if len(payload.jpeg_b64) > (MAX_EVIDENCE_BYTES * 4) // 3 + 8:
+        raise HTTPException(status_code=422, detail="candidate too large")
+    try:
+        import base64 as _b64
+
+        jpeg = _b64.b64decode(payload.jpeg_b64, validate=True)
+    except (ValueError, binascii.Error) as e:
+        raise HTTPException(status_code=422, detail=f"bad candidate: {e}")
+
+    background.add_task(
+        run_early_plate_attempt,
+        payload.camera_id, payload.track_id, payload.ts, jpeg,
+    )
+    return {"status": "queued"}
 
 
 @router.get("/events")
@@ -145,7 +520,7 @@ async def internal_list_events(
     from_: datetime | None = Query(default=None, alias="from"),
     to: datetime | None = None,
     limit: int = 100,
-    _: None = Depends(_require_internal_key),
+    principal=Depends(_require_internal_key),
     db: Session = Depends(get_db),
 ):
     """Event-store read for trusted internal components (the camera agents).
@@ -156,8 +531,10 @@ async def internal_list_events(
     """
     from services.timeline_service import query_events
 
+    # An app key sees its own roster's visits only (site key: the fleet).
     rows = query_events(db, camera_id=camera_id, label=label, plate=plate,
-                        from_=from_, to=to, limit=limit)
+                        from_=from_, to=to, limit=limit,
+                        scope=_app_roster(db, principal))
     return {
         "events": [
             {
@@ -167,9 +544,22 @@ async def internal_list_events(
                 "score": e.score,
                 "started_at": e.started_at.isoformat() if e.started_at else None,
                 "ended_at": e.ended_at.isoformat() if e.ended_at else None,
+                # When the plate was seen, for apps that log or report on
+                # reads — the visit's start is a different moment. Null
+                # when unknown; fall back to started_at.
+                "observed_at": (
+                    e.observed_at.isoformat() if e.observed_at else None
+                ),
                 "stationary": (e.payload or {}).get("stationary"),
                 "plate_text": e.plate_text,
                 "has_evidence": bool(e.evidence_path),
+                # False when the two paths are equal: a frame-filling box
+                # crops to the frame itself, and content-addressing then
+                # makes them ONE file — there is no second image to fetch.
+                "has_scene_evidence": bool(
+                    e.scene_evidence_path
+                    and e.scene_evidence_path != e.evidence_path
+                ),
             }
             for e in rows
         ]
@@ -179,7 +569,7 @@ async def internal_list_events(
 @router.get("/events/{event_id}/evidence")
 async def internal_event_evidence(
     event_id: int,
-    _: None = Depends(_require_internal_key),
+    principal=Depends(_require_internal_key),
     db: Session = Depends(get_db),
 ):
     """The visit's best-frame JPEG, for agent-side face match / VLM looks."""
@@ -189,9 +579,40 @@ async def internal_event_evidence(
     from services.evidence_store import resolve_evidence
 
     e = db.query(TimelineEvent).filter(TimelineEvent.id == event_id).first()
+    roster = _app_roster(db, principal)
+    if e is not None and roster is not None and int(e.camera_id) not in roster:
+        e = None   # 404, not 403: another app's camera is not confirmed to exist
     if e is None or not e.evidence_path:
         raise HTTPException(status_code=404, detail="no evidence")
     path = resolve_evidence(e.evidence_path)
+    if path is None:
+        raise HTTPException(status_code=404, detail="evidence missing")
+    return FileResponse(path, media_type="image/jpeg")
+
+
+@router.get("/events/{event_id}/scene-evidence")
+async def internal_event_scene_evidence(
+    event_id: int,
+    principal=Depends(_require_internal_key),
+    db: Session = Depends(get_db),
+):
+    """The whole frame behind the best crop — a wider look for the VLM path.
+
+    404 when the pipeline sent no scene frame (or the row predates the
+    column); callers fall back to ``/evidence``.
+    """
+    from fastapi.responses import FileResponse
+
+    from models import TimelineEvent
+    from services.evidence_store import resolve_evidence
+
+    e = db.query(TimelineEvent).filter(TimelineEvent.id == event_id).first()
+    roster = _app_roster(db, principal)
+    if e is not None and roster is not None and int(e.camera_id) not in roster:
+        e = None   # 404, not 403: another app's camera is not confirmed to exist
+    if e is None or not e.scene_evidence_path:
+        raise HTTPException(status_code=404, detail="no scene evidence")
+    path = resolve_evidence(e.scene_evidence_path)
     if path is None:
         raise HTTPException(status_code=404, detail="evidence missing")
     return FileResponse(path, media_type="image/jpeg")
@@ -204,7 +625,7 @@ _VALID_GATE_MODES = ("off", "shadow", "enforce")
 
 @router.get("/detect-config")
 async def get_detect_config(
-    _: None = Depends(_require_internal_key),
+    principal=Depends(_require_internal_key),
     db: Session = Depends(get_db),
 ):
     """Effective Tier-0 gate override for the detect-pipeline.
@@ -213,6 +634,7 @@ async def get_detect_config(
     flips shadow->enforce in the UI; the pipeline applies it live, no
     redeploy). ``gate_mode: null`` means "no override — follow your env".
     """
+    _platform_only(principal)
     row = (
         db.query(SecuritySetting)
         .filter(SecuritySetting.key == GATE_MODE_KEY)
@@ -255,8 +677,9 @@ def _mint_mediamtx_jwt() -> str | None:
         return None
 
 
-@router.get("/cameras", dependencies=[Depends(_require_internal_key)])
+@router.get("/cameras")
 def list_camera_agent_sources(
+    principal=Depends(_require_internal_key),
     db: Session = Depends(get_db),
     x_detect_hwaccel: str | None = Header(default=None, alias="X-Detect-Hwaccel"),
 ) -> dict[str, object]:
@@ -294,6 +717,14 @@ def list_camera_agent_sources(
         .order_by(Camera.id.asc())
         .all()
     )
+    # An app key gets the cameras the operator assigned to it, and only
+    # those — an app assigned nothing gets an empty roster rather than
+    # the fleet. The site key (detect-pipeline, KAI-C) still gets every
+    # camera. Same rule the SDK's cameras_for_skill applies client-side,
+    # enforced here where the frames are actually handed out.
+    roster = _app_roster(db, principal)
+    if roster is not None:
+        cameras = [c for c in cameras if int(c.id) in roster]
     out: list[dict[str, object]] = []
     for cam in cameras:
         stream_name = _build_stream_name(
@@ -375,10 +806,9 @@ def list_camera_agent_sources(
                 "frame_url": frame_url,
                 "role": role,
                 "source": source,
-                # Per-camera capability assignment (slice 1 of
-                # docs/design/per-camera-assignment.md). Additive: existing
-                # consumers ignore it. [] = nothing assigned — consumers must
-                # read that as "no restriction declared", never "do nothing".
+                # Per-camera capability assignment. [] = nothing
+                # assigned: the camera is eligible for any skill's picker
+                # but adopted by none, so no app inference runs on it.
                 "assignments": list(cam.assignments or []),
             }
         )
@@ -391,7 +821,7 @@ def list_camera_agent_sources(
 async def internal_recording_frame(
     camera_id: int = Query(..., description="Camera ID"),
     at: str = Query(..., description="Wall-clock instant (ISO 8601)"),
-    _: None = Depends(_require_internal_key),
+    principal=Depends(_require_internal_key),
     db: Session = Depends(get_db),
 ):
     """One JPEG from recorded footage at a past instant, for the agent's
@@ -411,6 +841,9 @@ async def internal_recording_frame(
     if at_dt.tzinfo is None:
         at_dt = at_dt.replace(tzinfo=UTC)
 
+    roster = _app_roster(db, principal)
+    if roster is not None and int(camera_id) not in roster:
+        raise HTTPException(status_code=404, detail="no recording at that time")
     job = _resolve_frame_job(db, camera_id, at_dt)
     if job is None:
         raise HTTPException(status_code=404, detail="no recording at that time")

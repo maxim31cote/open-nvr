@@ -8,7 +8,7 @@ camera feeds via tool calling.
 Pipeline:
     WebSocket transport (browser ⇄ server raw PCM 16k mono)
         ↓
-    SileroVADAnalyzer (turn detection)
+    Silero VAD (turn start) + Smart Turn v3 (semantic end of turn)
         ↓
     OpenNvrWhisperSTT (Whisper adapter → text)
         ↓
@@ -27,6 +27,20 @@ Then visit http://localhost:9100/demo in your browser, click "Start",
 and speak.
 """
 from __future__ import annotations
+
+import os
+
+# Math-library thread caps — set BEFORE anything imports numpy (Pipecat
+# pulls it in lazily). Smart Turn v3's feature step (an 8 s Whisper
+# log-mel computed in numpy) otherwise fans out across every core through
+# OpenBLAS/OpenMP; on a 4-core box that made one end-of-turn verdict
+# SLOWER (90–130 ms) than single-threaded (~60 ms) while stealing cores
+# from Whisper and Piper next door. onnxruntime keeps its own pool, sized
+# by ``turn_cpu_threads``. An operator's explicit value in the
+# environment always wins (setdefault).
+for _var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
+    os.environ.setdefault(_var, "1")
+del _var
 
 import argparse
 import asyncio
@@ -67,8 +81,15 @@ from adapter_clients import (
 from context import (
     CameraContext,
     CameraSpec,
+    camera_in_scope,
+    camera_scope,
+    reset_camera_scope,
     run_app_alert_subscriber,
+    run_core_tracks_subscriber,
     run_event_subscriber,
+    scoped_cameras,
+    set_camera_scope,
+    spawn_unscoped,
 )
 from frame_sources import build_frame_source, discover_local_cameras
 from monitor_host import MonitorHost
@@ -149,6 +170,56 @@ class AppConfig:
     llm_model: str = "qwen2.5:1.5b"
     llm_temperature: float = 0.4
     llm_max_tokens: int = 256
+
+    # Turn-taking (Pipecat 1.8). Silero VAD opens a turn; Smart Turn v3
+    # (semantic end-of-turn, bundled, CPU) closes it. The VAD stop window
+    # is short on purpose — the model judges the pause, the VAD only
+    # notices it. turn_stop_secs: silence after which Smart Turn is
+    # consulted for an "incomplete" verdict again / a fallback stop;
+    # turn_max_secs: the longest single utterance; turn_stop_timeout_secs:
+    # the aggregator's last resort so a turn can never hang.
+    vad_confidence: float = 0.55
+    vad_start_secs: float = 0.15
+    vad_stop_secs: float = 0.2
+    vad_min_volume: float = 0.08
+    turn_stop_secs: float = 2.0
+    # Smart Turn v3 only ever looks at the LAST 8 s of a turn (it pads or
+    # truncates to the model window), so buffering more is pure cost.
+    turn_max_secs: float = 8.0
+    turn_stop_timeout_secs: float = 6.0
+    # Hardware fit. turn_detector: "smart" (Smart Turn v3), "timer" (a
+    # plain silence timer, no model — for single-core boxes), or "auto"
+    # (smart when ≥2 cores are available to this process, else timer).
+    # turn_cpu_threads: onnxruntime threads for one Smart Turn verdict;
+    # None = auto (1 thread up to 7 cores — measured fastest — 2 from 8).
+    # turn_timer_secs: the silence that ends a turn in timer mode.
+    turn_detector: str = "auto"
+    turn_cpu_threads: int | None = None
+    turn_timer_secs: float = 0.8
+    # Interruptions on the streaming (/ws) pipeline — turns.py. "gated"
+    # (default): while the agent speaks, only a phrase that is real speech
+    # of at least interrupt_min_ms, holds interrupt_min_words words once
+    # backchannels ("mm-hm", "okay") are stripped, and — when
+    # interrupt_addressee is on — reads as said TO the agent, cuts it off;
+    # everything else is ignored and the agent keeps talking. "off": the
+    # agent always finishes (the pre-1.8 behaviour). "eager": any speech
+    # interrupts (plain VAD).
+    interruptions: str = "gated"
+    interrupt_min_ms: float = 300.0
+    interrupt_min_words: int = 2
+    interrupt_addressee: bool = True
+    # Thinking aloud (fillers.py): when a voice question needs a slow tool,
+    # the agent says what it is about to do ("let me check the gate camera
+    # between 2 and 3") while it does it. One sentence shape per tool with
+    # the tool call's own arguments slotted in — no LLM; Piper synthesis
+    # cached by text and run in parallel with the tool; at most one per
+    # turn; only when the expected wait (this site's own recent stage
+    # timings) is at least filler_min_ms. filler_source "model" asks the
+    # LLM to write the line in the SAME first pass (a few extra output
+    # tokens), template as fallback.
+    thinking_aloud: bool = True
+    filler_min_ms: float = 1500.0
+    filler_source: str = "template"
     # Reasoning toggle for "thinking" models (Qwen3 etc.). Leave None for
     # non-thinking models (no effect). Set False to force snappy, non-thinking
     # tool-calling (appends Qwen3's ``/no_think`` switch); True to allow it.
@@ -241,12 +312,34 @@ class AppConfig:
     # arms its after-hours person alarm as  person: siren . An explicit
     # ring on the alarm always wins; this only decides the DEFAULT.
     alarm_ring_defaults: dict[str, str] | None = None
+    # SITE FALLBACK for which relayed APP alerts the voice UI speaks aloud
+    # (they always land in the feed with a chime): "all", "important"
+    # (high/critical only) or "none".
+    #
+    # "none" is the default, and the default changed: "important" used to
+    # be, but app alerts are mostly high/critical — so ANPR narrated every
+    # plate and occupancy called every count, mid-conversation. Speaking is
+    # opt-in now.
+    #
+    # This is only the fallback. A per-app decision from the Skills panel
+    # (persisted as `app_announce`) beats it in both directions.
+    # Operator-editable in the UI (Automations → ⚙); the UI choice persists
+    # in the state file and wins over this.
+    announce_app_alerts: str = "none"
 
     # Public base URL of THIS agent (e.g. "https://agent.nvr.example"), used
     # only to put a tap-to-open deep link (/demo/camera/{id}) into outgoing
     # notifications — a phone push lands on the right camera's screen.
     # Unset = notifications carry no link.
     agent_public_url: str | None = None
+    # The base URL CORE reaches this agent at on the compose network —
+    # what the agent registers with the App Catalog as its contract URL
+    # (core probes {url}/health and {url}/state from there). Must be the
+    # compose service name, which is also in the TLS certificate's SAN
+    # (``https://camera-agent:9100``). Unset = this container's hostname,
+    # which under compose is the bare container id: not resolvable by
+    # other containers, and not in any certificate.
+    agent_contract_url: str | None = None
 
     # Optional base URL of the main OpenNVR UI (e.g. "https://nvr.example"),
     # used only to build a deep link into the AI Adapters view when a skill is
@@ -890,7 +983,7 @@ def _frames_for(runtime, max_frames: int = 3) -> list[dict]:
     so the UI can SHOW what the agent saw in the chat. Reads the per-turn frame
     cache (populated by the vision tools) for the cameras in last_cameras_used —
     no extra fetch. Capped in count and size to keep the response small."""
-    roles = {c.camera_id: c.role for c in runtime.cfg.cameras}
+    roles = {c.camera_id: c.role for c in runtime.visible_cameras()}
     out: list[dict] = []
     seen: set[str] = set()
     for cid in getattr(runtime.tools, "last_cameras_used", []) or []:
@@ -921,14 +1014,37 @@ def _frames_for(runtime, max_frames: int = 3) -> list[dict]:
     return out
 
 
-def greeting_for(name: str | None = None) -> str:
+def time_of_day_salutation(hour: int | None = None) -> str:
+    """"Good morning" / "Good afternoon" / "Good evening" for ``hour``
+    (0–23; the OPERATOR's local hour when the browser sent one, else this
+    process's local clock — the site's TZ under compose). Late night
+    (00:00–04:59) says "Hello" rather than a "Good morning" nobody means."""
+    from datetime import datetime as _dt
+
+    if hour is None:
+        hour = _dt.now().hour
+    try:
+        hour = int(hour) % 24
+    except (TypeError, ValueError):
+        hour = _dt.now().hour
+    if 5 <= hour < 12:
+        return "Good morning"
+    if 12 <= hour < 17:
+        return "Good afternoon"
+    if 17 <= hour < 22:
+        return "Good evening"
+    return "Hello"
+
+
+def greeting_for(name: str | None = None, hour: int | None = None) -> str:
     # No persona name by design — the agent introduces itself by the product
     # name, "the OpenNVR Agent" (formerly "Camera Agent"), described as your
     # camera agent. (``name`` is accepted for call-site compat.)
-    # Short by design: this is SPOKEN (Piper) before the first
-    # interaction — every extra word delays the user's first question.
+    # Short by design: this is SPOKEN (Piper) when the page opens — every
+    # extra word delays the user's first question. Opens with the time of
+    # day like a person would.
     return (
-        "Hi, I'm the OpenNVR Agent — your camera agent. "
+        f"{time_of_day_salutation(hour)}, I'm the OpenNVR Agent — your camera agent. "
         "Ask me anything about your cameras; I can also set alarms, "
         "watches, and reports."
     )
@@ -986,7 +1102,7 @@ class TaskManager:
         while len(self._order) > self._max:
             old = self._order.pop(0)
             self._tasks.pop(old, None)
-        asyncio.create_task(self._run(task), name=f"agent-task-{task.id}")
+        spawn_unscoped(self._run(task), name=f"agent-task-{task.id}")
         logger.info("task #%d queued: %r", task.id, task.query)
         return task
 
@@ -1214,7 +1330,7 @@ class MonitorManager:
             self._monitors.pop(old, None)
         if kind not in self._CONVERGED:
             # Legacy poll loop — only kind="notify" lands here now.
-            self._tasks[mon.id] = asyncio.create_task(self._loop(mon), name=f"monitor-{mon.id}")
+            self._tasks[mon.id] = spawn_unscoped(self._loop(mon), name=f"monitor-{mon.id}")
         logger.info("monitor #%d (%s %r on %s) started", mon.id, kind, target, camera_ids)
         return mon
 
@@ -1704,7 +1820,7 @@ class AlarmManager:
             old = self._order.pop(0)
             self.stop(old)
             self._alarms.pop(old, None)
-        self._tasks[alarm.id] = asyncio.create_task(self._loop(alarm), name=f"alarm-{alarm.id}")
+        self._tasks[alarm.id] = spawn_unscoped(self._loop(alarm), name=f"alarm-{alarm.id}")
         logger.info("alarm #%d %r (%s on %s, %s) armed", alarm.id, alarm.name,
                     alarm.target, camera_ids, alarm.window_label())
         return alarm
@@ -2407,7 +2523,7 @@ class ReportScheduler:
 
     def start(self) -> None:
         if self._task is None:
-            self._task = asyncio.create_task(self._loop(), name="report-scheduler")
+            self._task = spawn_unscoped(self._loop(), name="report-scheduler")
 
     def stop_all(self) -> None:
         if self._task:
@@ -2846,6 +2962,24 @@ def load_config(path: str | Path) -> AppConfig:
         llm_model=_str("llm_model", "qwen2.5:1.5b"),
         llm_temperature=_float("llm_temperature", 0.4),
         llm_max_tokens=_int("llm_max_tokens", 256),
+        vad_confidence=_float("vad_confidence", 0.55),
+        vad_start_secs=_float("vad_start_secs", 0.15),
+        vad_stop_secs=_float("vad_stop_secs", 0.2),
+        vad_min_volume=_float("vad_min_volume", 0.08),
+        turn_stop_secs=_float("turn_stop_secs", 2.0),
+        turn_max_secs=_float("turn_max_secs", 8.0),
+        turn_stop_timeout_secs=_float("turn_stop_timeout_secs", 6.0),
+        turn_detector=_str("turn_detector", "auto"),
+        turn_cpu_threads=(int(raw["turn_cpu_threads"]) if raw.get("turn_cpu_threads") else None),
+        turn_timer_secs=_float("turn_timer_secs", 0.8),
+        interruptions=_str("interruptions", "gated"),
+        interrupt_min_ms=_float("interrupt_min_ms", 300.0),
+        interrupt_min_words=_int("interrupt_min_words", 2),
+        interrupt_addressee=(True if raw.get("interrupt_addressee") is None
+                             else bool(raw.get("interrupt_addressee"))),
+        thinking_aloud=(True if raw.get("thinking_aloud") is None else bool(raw.get("thinking_aloud"))),
+        filler_min_ms=_float("filler_min_ms", 1500.0),
+        filler_source=_str("filler_source", "template"),
         enabled_tools=(
             list(raw["enabled_tools"])
             if isinstance(raw.get("enabled_tools"), list)
@@ -2869,6 +3003,8 @@ def load_config(path: str | Path) -> AppConfig:
         opennvr_ui_url=_opennvr_ui_url,
         auth_mode=str(raw.get("auth_mode") or "none").strip().lower(),
         agent_public_url=raw.get("agent_public_url"),
+        agent_contract_url=raw.get("agent_contract_url"),
+        announce_app_alerts=_str("announce_app_alerts", "none"),
         alarm_ring_defaults=(
             {str(k).strip().lower(): str(v).strip().lower()
              for k, v in raw["alarm_ring_defaults"].items()}
@@ -2916,31 +3052,26 @@ _OPENNVR_CAMERA_RECONCILE_SLOW = 30.0
 
 
 def _load_opennvr_cameras(*, url: str, api_key: str) -> list[CameraSpec]:
-    """Load frame sources from OpenNVR's internal camera-agent endpoint."""
-    import httpx
+    """Load frame sources from OpenNVR through the SDK's camera discovery.
 
-    headers = {"X-Internal-Api-Key": api_key}
-    try:
-        response = httpx.get(url, headers=headers, timeout=15.0, trust_env=False)
-        response.raise_for_status()
-        payload = response.json()
-    except Exception as exc:
-        logger.warning(
-            "config: could not load cameras from OpenNVR (%s): %s",
-            url,
-            exc,
-        )
-        return []
+    ``url`` is the configured ``opennvr_cameras_url`` (historically the
+    full internal-endpoint URL); the SDK takes the server base, so the
+    endpoint path is stripped when present. Never raises — an
+    unreachable core at boot is an empty roster and a warning, and the
+    reconcile loop keeps trying."""
+    from opennvr_app_sdk import discover_cameras
+    from opennvr_app_sdk.cameras import CAMERAS_PATH
 
-    raw_cameras = payload.get("cameras") if isinstance(payload, dict) else None
-    if not isinstance(raw_cameras, list):
-        logger.warning("config: OpenNVR cameras response had no 'cameras' list")
+    base = url.rstrip("/")
+    if base.endswith(CAMERAS_PATH):
+        base = base[: -len(CAMERAS_PATH)]
+    raw_cameras = discover_cameras(base, api_key=api_key or None, timeout=15.0)
+    if not raw_cameras:
+        logger.warning("config: no cameras loaded from OpenNVR (%s)", url)
         return []
 
     cameras: list[CameraSpec] = []
     for entry in raw_cameras:
-        if not isinstance(entry, dict):
-            continue
         cam_id = entry.get("camera_id")
         frame_url = entry.get("frame_url")
         if not cam_id or not frame_url:
@@ -3181,6 +3312,27 @@ class CameraAgentRuntime:
         # LAST layer over config + built-ins in ring_defaults(); durable
         # via persist()/load_state like the skill toggles.
         self._ring_overrides: dict[str, str] = {}
+        self._announce_app_alerts: str | None = None   # UI override of cfg
+        # Per-app speech, set from the Skills panel: app_id -> bool. An
+        # entry here BEATS the global policy for that app, so an operator
+        # can let the doorbell speak while ANPR stays quiet. Absent = fall
+        # back to the global policy (which itself defaults to "none").
+        self._app_announce: dict[str, bool] = {}
+        # Interruption decisions on the streaming pipeline (turns.py): what
+        # was said over the agent, how long, and whether it yielded — the
+        # evidence to tune the gate from. GET /interruptions.
+        self.interruption_log: deque = deque(maxlen=200)
+        # Thinking aloud (fillers.py) + the push channel the demo page
+        # listens on (/updates): a "working" line is published the moment
+        # the first tool call is known, so the page can speak it while
+        # the tool runs.
+        from fillers import ThinkingAloud
+        self.thinking = ThinkingAloud(
+            min_ms=float(getattr(cfg, "filler_min_ms", 1500.0)),
+            source=str(getattr(cfg, "filler_source", "template") or "template"),
+            enabled=bool(getattr(cfg, "thinking_aloud", True)),
+        )
+        self._update_subscribers: set = set()
         self._configure_tools()
         self.tool_handlers = {
             "describe_camera": self.tools.describe_camera,
@@ -3373,6 +3525,108 @@ class CameraAgentRuntime:
                     merged[k] = v
         return merged
 
+    # ── push channel for the page (/updates) ─────────────────────────
+    def subscribe_updates(self) -> "asyncio.Queue":
+        q: asyncio.Queue = asyncio.Queue(maxsize=32)
+        self._update_subscribers.add(q)
+        return q
+
+    def unsubscribe_updates(self, q: "asyncio.Queue") -> None:
+        self._update_subscribers.discard(q)
+
+    def _relay_tracks(self, core_camera_id: int, frame: dict[str, Any]) -> None:
+        """Tier-0 tracks for core camera N → the agent camera that maps to
+        it, pushed to the demo as {"tracks": {camera, ...}}. Dropped when
+        no configured camera claims that core id — boxes for a camera this
+        agent does not know are not this agent's to show."""
+        cam = next((c.camera_id for c in self.cfg.cameras
+                    if getattr(c, "opennvr_camera_id", None) == core_camera_id), None)
+        if cam is None:
+            return
+        self.publish_update({"tracks": {"camera": cam, **frame}})
+
+    def publish_update(self, payload: dict[str, Any]) -> None:
+        for q in list(self._update_subscribers):
+            try:
+                q.put_nowait(payload)
+            except asyncio.QueueFull:
+                pass
+
+    async def say_working(self, text: str, *, voice: bool) -> None:
+        """Push a "working" line to the page — with audio for a voice turn
+        (Piper, cached by text, run here in parallel with the tool the
+        line announces); text only for a typed question. Never raises."""
+        audio_b64 = None
+        if voice:
+            try:
+                cache = self.thinking.audio
+                audio_b64 = cache.get(text)
+                if audio_b64 is None:
+                    audio = await self.piper.synthesize(text)
+                    if audio:
+                        audio_b64 = base64.b64encode(audio).decode("ascii")
+                        if len(cache) >= 64:
+                            cache.pop(next(iter(cache)))
+                        cache[text] = audio_b64
+            except Exception as exc:  # noqa: BLE001 — the line is optional
+                logger.debug("thinking aloud: TTS unavailable (%s); text only", exc)
+        self.publish_update({"working": {"text": text, "audio_b64": audio_b64, "ts": time.time()}})
+
+    ANNOUNCE_LEVELS = ("all", "important", "none")
+
+    def announce_app_alerts(self) -> str:
+        """Effective policy for speaking relayed app alerts: the UI
+        override when one was saved, else config, else "important"."""
+        for v in (self._announce_app_alerts, getattr(self.cfg, "announce_app_alerts", None)):
+            v = str(v or "").strip().lower()
+            if v in self.ANNOUNCE_LEVELS:
+                return v
+        return "important"
+
+    def set_announce_app_alerts(self, level: str) -> str:
+        level = str(level or "").strip().lower()
+        if level not in self.ANNOUNCE_LEVELS:
+            raise ValueError("announce_app_alerts must be all|important|none")
+        self._announce_app_alerts = level
+        self.persist()
+        return level
+
+    def app_announce_overrides(self) -> dict[str, bool]:
+        """Per-app speech decisions the operator has actually made."""
+        return dict(self._app_announce)
+
+    def set_app_announce(self, app_id: str, speak: bool | None) -> dict[str, bool]:
+        """Turn speech on/off for one app; ``None`` clears the override so
+        the app follows the global policy again."""
+        key = str(app_id or "").strip().lower()
+        if not key:
+            raise ValueError("app_id is required")
+        if speak is None:
+            self._app_announce.pop(key, None)
+        else:
+            self._app_announce[key] = bool(speak)
+        self.persist()
+        return self.app_announce_overrides()
+
+    def should_announce_app_alert(
+        self, severity: str | None, app_id: str | None = None
+    ) -> bool:
+        """Speak this relayed app alert?
+
+        A per-app decision wins outright — that is the point of it: the
+        operator silenced THIS app, or asked for it specifically, and a
+        global rule must not overrule either. Only when no such decision
+        exists does the site policy apply."""
+        key = str(app_id or "").strip().lower()
+        if key and key in self._app_announce:
+            return self._app_announce[key]
+        policy = self.announce_app_alerts()
+        if policy == "all":
+            return True
+        if policy == "none":
+            return False
+        return str(severity or "").strip().lower() in ("high", "critical")
+
     def set_ring_overrides(self, overrides: dict[str, str]) -> dict[str, str]:
         """Replace the UI-edited overrides (sanitized), persist, return
         the merged map. Junk levels and blank targets are dropped."""
@@ -3385,6 +3639,12 @@ class CameraAgentRuntime:
         self._ring_overrides = clean
         self.persist()
         return self.ring_defaults()
+
+    def visible_cameras(self) -> list[CameraSpec]:
+        """The roster as the CURRENT CALLER may see it — the full fleet
+        outside a scoped request (background loops, auth_mode none). Every
+        request-serving read of ``cfg.cameras`` goes through here."""
+        return scoped_cameras(self.cfg.cameras)
 
     def events_feed(self, limit: int = 50) -> list[dict[str, Any]]:
         """ONE feed of what happened — alarm rings, watch hits, and app
@@ -3407,7 +3667,10 @@ class CameraAgentRuntime:
                         "detail": str(al.summary or ""),
                         "severity": str(al.severity or "info"),
                         "kind": "app", "source": al.app_id})
-        out = [e for e in out if e.get("ts")]
+        # A caller sees the alarms/watches/alerts of THEIR cameras; an
+        # entry about no camera in particular reaches everyone.
+        out = [e for e in out if e.get("ts")
+               and (not e["camera_id"] or camera_in_scope(e["camera_id"]))]
         out.sort(key=lambda e: e["ts"], reverse=True)
         return out[:limit]
 
@@ -3613,6 +3876,9 @@ class CameraAgentRuntime:
                 for e in (manifest.get("emits") or [])
                 if isinstance(e, dict) and e.get("name")
             ]
+            muted = self.app_muted(app_id)
+            _app_speech_override = self._app_announce.get(
+                str(app_id or "").strip().lower())
             entries.append({
                 "id": f"app:{app_id}",
                 "source": "app",           # clearly marks the app door origin
@@ -3624,12 +3890,33 @@ class CameraAgentRuntime:
                         else "installed app",
                 "summary": summary,
                 "emits": emits,
-                # Installed + enabled by an operator ⇒ enabled. The agent
-                # can query it (read-only); it can't toggle or configure it.
-                "enabled": True,
+                # Installed + enabled by an operator in the catalog ⇒ the
+                # agent may use it; ✕ here MUTES it in the agent only (no
+                # relay, not listed, not queried) — the app keeps running
+                # for the rest of OpenNVR. Re-add it from "+" any time.
+                "enabled": not muted,
                 "available": True,
-                "read_only": True,
-                "hint": "",
+                "read_only": False,
+                "hint": ("off in the agent — tap to add it back; the app "
+                         "itself keeps running" if muted else
+                         "installed app — tapping turns it off in the agent "
+                         "only; enable, disable or uninstall the app itself "
+                         "in the App Catalog"),
+                # Can this app speak AT ALL? Not "would this particular
+                # severity be spoken" — the chip has no alert in hand, and
+                # asking should_announce_app_alert() with no severity would
+                # answer False under the "important" policy, showing a
+                # muted speaker for an app whose critical alerts do speak.
+                # `speaks_override` is null when the operator has made no
+                # per-app decision and the app follows the site policy.
+                "speaks": (
+                    bool(_app_speech_override) if _app_speech_override is not None
+                    else self.announce_app_alerts() != "none"),
+                "speaks_override": _app_speech_override,
+                # Where the operator manages it (the app's catalog page).
+                "manage_url": (
+                    f"{self.cfg.opennvr_ui_url.rstrip('/')}/app-catalog/{app_id}"
+                    if getattr(self.cfg, "opennvr_ui_url", None) else None),
                 "backing_tasks": [],
                 "tasks_available": True,
             })
@@ -3638,6 +3925,20 @@ class CameraAgentRuntime:
     def set_skill_enabled(self, skill_id: str, enabled: bool) -> bool:
         """Turn a skill on/off and reconfigure the toolset. Returns False if the
         skill is unknown or can't be enabled (backend not configured)."""
+        if skill_id.startswith("app:"):
+            # An installed catalog app, muted or unmuted IN THE AGENT only:
+            # the app keeps running for the rest of OpenNVR (its own page,
+            # the inbox); the agent just stops relaying its alerts and
+            # stops counting it among the apps it queries. Same durable
+            # toggle set as the agent's own skills, same Restore defaults.
+            app_id = skill_id[4:].strip()
+            if not app_id or not self._app_known(app_id):
+                return False
+            if enabled:
+                self.disabled_skills.discard(skill_id)
+            else:
+                self.disabled_skills.add(skill_id)
+            return True
         if skill_id not in SKILL_TOOLS:
             return False
         if enabled:
@@ -3649,6 +3950,20 @@ class CameraAgentRuntime:
             self.disabled_skills.add(skill_id)
         self._configure_tools()
         return True
+
+    def _app_known(self, app_id: str) -> bool:
+        """Is ``app_id`` an installed app as far as the registry cache
+        knows? With the registry unreachable (cache None) the answer is
+        yes — a stale state file must still be able to restore a mute."""
+        registry = getattr(self, "app_registry", None)
+        apps = getattr(registry, "apps_cached", None) if registry is not None else None
+        if apps is None:
+            return True
+        return any(str(a.get("id") or "") == app_id for a in apps)
+
+    def app_muted(self, app_id: str | None) -> bool:
+        """Muted in the agent: alerts not relayed, not listed, not queried."""
+        return bool(app_id) and f"app:{app_id}" in self.disabled_skills
 
     def hardware_recommendation(self) -> dict[str, Any]:
         """What the ENABLED skills run on vs. what makes them fast — the
@@ -3705,6 +4020,7 @@ class CameraAgentRuntime:
             "gpu_recommended": bool(gpu_labels),
             "summary": summary,
             "rows": rows,
+            "turn": turn_hardware_profile(self.cfg),
             "tips": [
                 "Chat mode instead of voice skips Piper TTS — the measured "
                 "CPU hog (~4 cores while speaking).",
@@ -3780,7 +4096,7 @@ class CameraAgentRuntime:
         # "all cameras" reads wrong on a single-camera install (the one
         # camera IS the fleet, but the operator armed it on THAT camera
         # and expects to hear its name back).
-        _fleet = {c.camera_id for c in self.cfg.cameras}
+        _fleet = {c.camera_id for c in self.visible_cameras()}
         where = ("all cameras" if len(_fleet) > 1 and set(cams) == _fleet
                  else ", ".join(cams))
         window = alarm.window_label()
@@ -3848,7 +4164,7 @@ class CameraAgentRuntime:
             return "What's the person's name?"
         cam = str(args.get("camera_id") or "").strip()
         if not self.context.known_camera(cam):
-            cams = [c.camera_id for c in self.cfg.cameras]
+            cams = [c.camera_id for c in self.visible_cameras()]
             return f"Which camera should I capture from? Available: {cams}."
         try:
             frame = await self.context.get_frame(cam)
@@ -3904,6 +4220,8 @@ class CameraAgentRuntime:
             # comes back on the next restart (its tools re-advertised).
             "disabled_skills": sorted(self.disabled_skills),
             "ring_overrides": dict(self._ring_overrides),
+            "announce_app_alerts": self._announce_app_alerts,
+            "app_announce": dict(self._app_announce),
         }
         try:
             d = os.path.dirname(self.cfg.state_path) or "."
@@ -3940,6 +4258,14 @@ class CameraAgentRuntime:
             self._ring_overrides = {
                 str(k).lower(): str(v).lower() for k, v in ro.items()
                 if str(v).lower() in ("siren", "pulse", "chime", "silent")}
+        aa = data.get("announce_app_alerts")
+        if isinstance(aa, str) and aa.lower() in self.ANNOUNCE_LEVELS:
+            self._announce_app_alerts = aa.lower()
+        ap = data.get("app_announce")
+        if isinstance(ap, dict):
+            self._app_announce = {
+                str(k).strip().lower(): bool(v) for k, v in ap.items()
+                if str(k).strip()}
         restored_disabled: list[str] = []
         for sid in (data.get("disabled_skills") or []):
             if self.set_skill_enabled(sid, False):
@@ -4017,7 +4343,7 @@ class CameraAgentRuntime:
         # "all cameras" reads wrong on a single-camera install (the one
         # camera IS the fleet, but the operator armed it on THAT camera
         # and expects to hear its name back).
-        _fleet = {c.camera_id for c in self.cfg.cameras}
+        _fleet = {c.camera_id for c in self.visible_cameras()}
         where = ("all cameras" if len(_fleet) > 1 and set(cams) == _fleet
                  else ", ".join(cams))
         if kind == "notify":
@@ -4057,8 +4383,15 @@ class CameraAgentRuntime:
         apps = await self.app_registry.list_apps()
         if apps is None:
             return self._APP_REGISTRY_UNREACHABLE
-        enabled = [a for a in apps if a.get("enabled")]
+        muted = [a for a in apps if a.get("enabled") and self.app_muted(str(a.get("id") or ""))]
+        enabled = [a for a in apps if a.get("enabled") and not self.app_muted(str(a.get("id") or ""))]
         if not enabled:
+            if muted:
+                return (
+                    "Every installed app is muted in this agent "
+                    f"({', '.join(str(a.get('name') or a.get('id')) for a in muted)}). "
+                    "The operator can add one back from the skills panel."
+                )
             if apps:
                 return (
                     "There are catalog apps installed, but none are currently "
@@ -4090,6 +4423,9 @@ class CameraAgentRuntime:
         app_id = str(args.get("app_id") or "").strip()
         if not app_id:
             return "Tell me which app — I need its id (from list_apps)."
+        if self.app_muted(app_id):
+            return (f"App '{app_id}' is muted in this agent — I don't relay or "
+                    "query it. The operator can add it back from the skills panel.")
         status = await self.app_registry.app_status(app_id)
         if status is None:
             return self._APP_REGISTRY_UNREACHABLE
@@ -4133,9 +4469,13 @@ class CameraAgentRuntime:
         else:
             app_id = str(app_arg).strip() or None
 
-        alerts = self.context.recent_app_alerts(
-            app_id=app_id, window_seconds=window
-        )
+        if app_id and self.app_muted(app_id):
+            return (f"App '{app_id}' is muted in this agent — its alerts aren't "
+                    "relayed here. The operator can add it back from the skills panel.")
+        alerts = [
+            a for a in self.context.recent_app_alerts(app_id=app_id, window_seconds=window)
+            if not self.app_muted(str(a.app_id))
+        ]
         if not alerts:
             scope = f"'{app_id}'" if app_id else "any app"
             mins = int(window / 60) or 1
@@ -4173,6 +4513,9 @@ class CameraAgentRuntime:
         side is rate-limited."""
         import time as _t
 
+        if self.app_muted(str(alert.app_id)):
+            logger.debug("app alert dropped (muted in the agent): app:%s", alert.app_id)
+            return
         now = _t.time()
         key = (str(alert.app_id), str(alert.camera_id))
         if now - self._app_relay_last.get(key, 0.0) < self.monitors._cooldown:
@@ -4185,7 +4528,14 @@ class CameraAgentRuntime:
         self.monitors._notifications.append({
             "id": self.monitors._next_note_id,
             "source": f"app:{alert.app_id}",
-            "text": f"{alert.title} — {alert.summary}",
+            "text": relay_text(alert.title, alert.summary),
+            "severity": str(alert.severity or "info"),
+            "camera": alert.camera_id,
+            # The feed always shows it (with a chime); whether the voice
+            # UI also SPEAKS it is this app's own setting when the operator
+            # made one, else the site policy.
+            "announce": self.should_announce_app_alert(
+                alert.severity, alert.app_id),
             "ts": now,
         })
         self.monitors._next_note_id += 1
@@ -4583,12 +4933,11 @@ class CameraAgentRuntime:
             return False
         import socket
 
-        scheme = "https" if self.cfg.tls_certfile else "http"
         own_url = (
-            self.cfg.agent_public_url
-            or f"{scheme}://{socket.gethostname()}:{self.cfg.port}"
+            self.cfg.agent_contract_url
+            or f"{agent_scheme(self.cfg)}://{socket.gethostname()}:{self.cfg.port}"
         ).rstrip("/")
-        payload = {"url": own_url, "manifest": agent_manifest()}
+        payload = {"url": own_url, "manifest": agent_manifest(self.cfg)}
         headers: dict[str, str] = {}
         if self._registry_key:
             # Both header shapes, same reason as the SDK: one configured
@@ -4662,6 +5011,33 @@ class CameraAgentRuntime:
                 "camera-agent: NATS not configured; recent_events and "
                 "recent_app_alerts tools will always report 'no events'"
             )
+
+        # Live detection overlay for the demo's own player. Fed from
+        # CORE's /events/ws, not from the bus: core's bridge is where the
+        # site switch, each app's overlay permission and the box maths are
+        # decided, and the agent must not re-derive any of that. Reads as a
+        # platform service (INTERNAL_API_KEY → unscoped ticket) and
+        # re-scopes every frame per viewer before it reaches a page — see
+        # _tracks_push_visible. Read/draw only.
+        if self.cfg.opennvr_api_url:
+            import os as _os
+
+            _core_key = (
+                self.cfg.opennvr_api_key
+                or self.cfg.kaic_api_key
+                or _os.environ.get("INTERNAL_API_KEY", "")
+            )
+            self._core_tracks_task = asyncio.create_task(
+                run_core_tracks_subscriber(
+                    base_url=self.cfg.opennvr_api_url,
+                    api_key=_core_key,
+                    stop_event=self._stop_event,
+                    on_tracks=self._relay_tracks,
+                ),
+                name="camera-agent-core-tracks-subscriber",
+            )
+            logger.info("camera-agent: overlay tracks subscriber started on %s",
+                        self.cfg.opennvr_api_url)
 
         # Pre-warm the LLM in the background so the FIRST real question
         # doesn't pay the ~80s cold-load (Ollama loads the model into RAM
@@ -4865,7 +5241,7 @@ class CameraAgentRuntime:
         """Compose the system prompt the LLM sees: the agent's identity + the
         operator's base prompt + a per-camera roster + task guidance."""
         roster = "\n".join(
-            f"- {cam.camera_id}: {cam.role}" for cam in self.cfg.cameras
+            f"- {cam.camera_id}: {cam.role}" for cam in self.visible_cameras()
         )
         # Per-turn wall clock, in the container's local timezone (TZ is passed
         # through by the compose files). Without this the model cannot turn
@@ -4966,6 +5342,13 @@ class CameraAgentRuntime:
         # Disable Qwen3-style "thinking" for snappy tool-calling when the
         # operator opted out. Only appended when llm_think is explicitly False,
         # so non-thinking models (qwen2.5, llama3.2, …) are unaffected.
+        if getattr(self.cfg, "filler_source", "template") == "model" and getattr(self.cfg, "thinking_aloud", True):
+            prompt += (
+                "\n\nWhen you call a tool, also write ONE short sentence (under twelve "
+                "words) telling the user what you are about to check — for example "
+                "'Let me look at the gate camera between two and three.' Never guess "
+                "the answer in that sentence."
+            )
         if self.cfg.llm_think is False:
             prompt += "\n\n/no_think"
         return prompt
@@ -4974,26 +5357,180 @@ class CameraAgentRuntime:
 # ── Pipecat pipeline factory ───────────────────────────────────────
 
 
-def build_pipeline_task(runtime: CameraAgentRuntime, transport: Any) -> Any:
-    """Construct one Pipecat pipeline per WebSocket conversation.
-    Imported here (not at module top) so the camera-agent module
-    stays importable in test environments without Pipecat."""
-    from pipecat.pipeline.pipeline import Pipeline
-    from pipecat.pipeline.task import PipelineParams, PipelineTask
-    from pipecat.processors.aggregators.openai_llm_context import (
-        OpenAILLMContext,
+def available_cores() -> int:
+    """CPU cores THIS process may actually use: the scheduler affinity
+    mask, further capped by a cgroup CPU quota (``docker run --cpus``,
+    compose ``cpus:``), which ``os.cpu_count()`` never reflects. Never
+    below 1."""
+    cores = None
+    try:
+        cores = len(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        pass
+    cores = cores or os.cpu_count() or 1
+    quota: float | None = None
+    try:  # cgroup v2
+        raw = Path("/sys/fs/cgroup/cpu.max").read_text().split()
+        if raw and raw[0] != "max":
+            quota = float(raw[0]) / float(raw[1])
+    except (OSError, ValueError, IndexError):
+        try:  # cgroup v1
+            q = float(Path("/sys/fs/cgroup/cpu/cpu.cfs_quota_us").read_text())
+            per = float(Path("/sys/fs/cgroup/cpu/cpu.cfs_period_us").read_text())
+            if q > 0 and per > 0:
+                quota = q / per
+        except (OSError, ValueError):
+            pass
+    if quota:
+        cores = min(cores, max(1, int(math.ceil(quota))))
+    return max(1, int(cores))
+
+
+def turn_hardware_profile(cfg: Any, cores: int | None = None) -> dict[str, Any]:
+    """Resolve the turn-taking knobs against the hardware the agent is
+    running on. ``auto`` picks the semantic detector wherever it has a
+    core to run on, and one onnxruntime thread per verdict (measured
+    fastest on ≤4 cores: ~60 ms; two threads only pay off from 8 cores).
+    Explicit config values are honoured verbatim."""
+    cores = int(cores if cores is not None else available_cores())
+    wanted = str(getattr(cfg, "turn_detector", "auto") or "auto").strip().lower()
+    if wanted not in ("auto", "smart", "timer"):
+        logger.warning("turn_detector=%r is not auto|smart|timer; using auto", wanted)
+        wanted = "auto"
+    if wanted == "auto":
+        detector = "smart" if cores >= 2 else "timer"
+        why = ("auto: Smart Turn v3 has a core to run on" if detector == "smart"
+               else "auto: single core — silence timer, no model")
+    else:
+        detector, why = wanted, "set in config"
+    threads = getattr(cfg, "turn_cpu_threads", None)
+    if threads is None:
+        threads = 2 if cores >= 8 else 1
+    threads = max(1, min(int(threads), cores))
+    return {
+        "cores": cores,
+        "detector": detector,
+        "cpu_threads": threads,
+        "math_threads": os.environ.get("OMP_NUM_THREADS", "unset"),
+        "reason": why,
+    }
+
+
+def describe_turn_profile(cfg: Any) -> str:
+    p = turn_hardware_profile(cfg)
+    if p["detector"] == "smart":
+        return (f"Smart Turn v3 (semantic end-of-turn) on CPU, "
+                f"{p['cpu_threads']} onnxruntime thread(s), BLAS/OMP threads="
+                f"{p['math_threads']}; {p['cores']} core(s) available ({p['reason']})")
+    return (f"silence timer ({float(getattr(cfg, 'turn_timer_secs', 0.8)):.2f}s), "
+            f"no turn model; {p['cores']} core(s) available ({p['reason']})")
+
+
+def build_user_turn_params(cfg: Any, runtime: Any = None) -> Any:
+    """The user aggregator's parameters — where turn-taking lives in
+    Pipecat 1.8. Silero VAD opens a turn; **Smart Turn v3** (the
+    bundled semantic end-of-turn model, CPU) closes it; the aggregator's
+    ``user_turn_stop_timeout`` is the last resort so a turn never hangs.
+    Interruptions stay off (the demo client sends no cancel frames).
+
+    Sized to the hardware by ``turn_hardware_profile``: the model's
+    onnxruntime thread count follows the cores available, and a
+    single-core box gets a plain silence timer instead of the model."""
+    from pipecat.audio.vad.silero import SileroVADAnalyzer
+    from pipecat.processors.aggregators.llm_response_universal import LLMUserAggregatorParams
+    from pipecat.turns.user_start import VADUserTurnStartStrategy
+    from pipecat.turns.user_turn_strategies import UserTurnStrategies
+
+    profile = turn_hardware_profile(cfg)
+    start = build_interruption_strategy(cfg, runtime=runtime)
+    if profile["detector"] == "smart":
+        from pipecat.audio.turn.smart_turn.base_smart_turn import SmartTurnParams
+        from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import LocalSmartTurnAnalyzerV3
+        from pipecat.turns.user_stop import TurnAnalyzerUserTurnStopStrategy
+
+        stop = TurnAnalyzerUserTurnStopStrategy(
+            turn_analyzer=LocalSmartTurnAnalyzerV3(
+                cpu_count=int(profile["cpu_threads"]),
+                params=SmartTurnParams(
+                    stop_secs=float(getattr(cfg, "turn_stop_secs", 2.0)),
+                    max_duration_secs=float(getattr(cfg, "turn_max_secs", 8.0)),
+                ),
+            ),
+        )
+    else:
+        from pipecat.turns.user_stop import SpeechTimeoutUserTurnStopStrategy
+
+        stop = SpeechTimeoutUserTurnStopStrategy(
+            user_speech_timeout=float(getattr(cfg, "turn_timer_secs", 0.8)),
+        )
+
+    return LLMUserAggregatorParams(
+        vad_analyzer=SileroVADAnalyzer(params=turn_vad_params(cfg)),
+        user_turn_strategies=UserTurnStrategies(
+            start=[start],
+            stop=[stop],
+        ),
+        user_turn_stop_timeout=float(getattr(cfg, "turn_stop_timeout_secs", 6.0)),
     )
-    # Context-aware aggregators (not the message-list variants).
-    # The plain LLMUserResponseAggregator / LLMAssistantResponseAggregator
-    # accept a ``List[dict]`` and call .append() on it; passing an
-    # OpenAILLMContext to those crashes with AttributeError on the
-    # first turn. The *Context* variants below take ``context=...``
-    # and route .add_message() correctly, which also mirrors the
-    # final assistant turn back into the context for observers.
-    from pipecat.processors.aggregators.llm_response import (
-        LLMUserContextAggregator,
-        LLMAssistantContextAggregator,
+
+
+def interruption_gate(cfg: Any, runtime: Any = None) -> "Any":
+    """The rule set for ``turns.GatedInterruptionStartStrategy`` from
+    config: thresholds, the agent's name, and the site's own vocabulary
+    (camera ids, names and roles) so "the gate camera" reads as addressed
+    to the agent."""
+    from turns import InterruptionGate
+
+    site: list[str] = []
+    for cam in (getattr(cfg, "cameras", None) or []):
+        for attr in ("camera_id", "name", "role"):
+            v = getattr(cam, attr, None)
+            if v:
+                site.append(str(v))
+    site += ["camera", "cameras", "gate", "plate", "plates", "alarm", "alarms",
+             "recording", "recordings", "footage", "monitor", "watch", "zone"]
+    return InterruptionGate(
+        min_ms=float(getattr(cfg, "interrupt_min_ms", 300.0)),
+        min_words=max(1, int(getattr(cfg, "interrupt_min_words", 2))),
+        addressee=bool(getattr(cfg, "interrupt_addressee", True)),
+        agent_name=str(getattr(cfg, "agent_name", "") or ""),
+        site_words=tuple(site),
     )
+
+
+def build_interruption_strategy(cfg: Any, runtime: Any = None) -> Any:
+    """The user-turn START strategy for the streaming pipeline, by the
+    ``interruptions`` setting: gated (turns.py), eager (plain VAD, any
+    speech interrupts) or off (the agent always finishes)."""
+    from pipecat.turns.user_start import VADUserTurnStartStrategy
+
+    mode = str(getattr(cfg, "interruptions", "gated") or "gated").strip().lower()
+    if mode == "off":
+        return VADUserTurnStartStrategy(enable_interruptions=False)
+    if mode == "eager":
+        return VADUserTurnStartStrategy(enable_interruptions=True)
+    if mode != "gated":
+        logger.warning("interruptions=%r is not gated|eager|off; using gated", mode)
+    from turns import make_start_strategy
+
+    gate = interruption_gate(cfg, runtime)
+    log = getattr(runtime, "interruption_log", None) if runtime is not None else None
+
+    def _record(event: dict[str, Any]) -> None:
+        if log is not None:
+            log.append({"ts": time.time(), **event})
+
+    return make_start_strategy(gate, on_decision=_record)
+
+
+def build_core_processors(runtime: CameraAgentRuntime, *, user_params: Any = None) -> tuple[list, Any]:
+    """The processors between the transport's input and output —
+    STT → user aggregator → LLM → TTS — plus the assistant aggregator
+    that closes the loop, and the shared ``LLMContext``. Split from the
+    transport so a test can run the real pipeline without a WebSocket.
+    """
+    from pipecat.processors.aggregators.llm_context import LLMContext
+    from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair
 
     from services import (
         OpenNvrOllamaLLM,
@@ -5011,13 +5548,33 @@ def build_pipeline_task(runtime: CameraAgentRuntime, transport: Any) -> Any:
     )
     tts = OpenNvrPiperTTS(client=runtime.piper)
 
-    context = OpenAILLMContext(messages=[
+    context = LLMContext(messages=[
         {"role": "system", "content": runtime.build_system_prompt()},
     ])
+    aggregators = LLMContextAggregatorPair(
+        context, user_params=user_params or build_user_turn_params(runtime.cfg, runtime),
+    )
+    return [stt, aggregators.user(), llm, tts, aggregators.assistant()], context
 
-    user_agg = LLMUserContextAggregator(context=context)
-    assistant_agg = LLMAssistantContextAggregator(context=context)
 
+def build_pipeline_task(runtime: CameraAgentRuntime, transport: Any) -> Any:
+    """Construct one Pipecat pipeline per WebSocket conversation.
+    Imported here (not at module top) so the camera-agent module
+    stays importable in test environments without Pipecat.
+
+    Turn-taking (Pipecat 1.8): the user aggregator owns it. Silero VAD
+    opens a turn; **Smart Turn v3** — Pipecat's semantic end-of-turn
+    model, bundled with the wheel and run on CPU with onnxruntime —
+    closes it, so a pause mid-sentence ("show me the… gate camera") no
+    longer ends the turn the way a silence timer did, and background
+    noise that Whisper would transcribe as a phantom question is not
+    a turn at all. See ``build_user_turn_params``.
+    """
+    from pipecat.pipeline.pipeline import Pipeline
+    from pipecat.pipeline.task import PipelineParams, PipelineTask
+
+    core, _context = build_core_processors(runtime)
+    stt, user_agg, llm, tts, assistant_agg = core
     pipeline = Pipeline([
         transport.input(),
         stt,
@@ -5030,16 +5587,24 @@ def build_pipeline_task(runtime: CameraAgentRuntime, transport: Any) -> Any:
 
     return PipelineTask(
         pipeline,
-        params=PipelineParams(
-            # Interruptions are DISABLED for v0.1: the bundled demo client
-            # doesn't send proper cancel frames, so any speech/noise while
-            # the agent is thinking would otherwise cancel the in-flight
-            # reply before it reaches TTS. With this off, the agent always
-            # finishes its answer, then listens again. (See README "No real
-            # interrupts".)
-            allow_interruptions=False,
-            enable_metrics=True,
-        ),
+        params=PipelineParams(enable_metrics=True),
+        # The bundled demo client speaks raw PCM, not RTVI.
+        enable_rtvi=False,
+    )
+
+
+def turn_vad_params(cfg: Any) -> Any:
+    """Silero VAD parameters for turn *start* (Smart Turn decides the
+    end). The stop window is short on purpose — with a semantic
+    end-of-turn model the VAD only has to notice a pause, not judge
+    it; Pipecat's guidance is 0.2 s."""
+    from pipecat.audio.vad.vad_analyzer import VADParams
+
+    return VADParams(
+        confidence=float(getattr(cfg, "vad_confidence", 0.55)),
+        start_secs=float(getattr(cfg, "vad_start_secs", 0.15)),
+        stop_secs=float(getattr(cfg, "vad_stop_secs", 0.2)),
+        min_volume=float(getattr(cfg, "vad_min_volume", 0.08)),
     )
 
 
@@ -5049,7 +5614,42 @@ def build_pipeline_task(runtime: CameraAgentRuntime, transport: Any) -> Any:
 AGENT_VERSION = "1.0.0"
 
 
-def agent_manifest() -> dict[str, Any]:
+def relay_text(title: str | None, summary: str | None) -> str:
+    """One line for the feed / the voice: ``title — summary``, unless the
+    summary already restates the title (SDK alerts often do: "Monitored
+    plate X seen — Monitored plate X seen: License plate…"), in which
+    case the summary alone."""
+    t = " ".join(str(title or "").split())
+    m = " ".join(str(summary or "").split())
+    if not m:
+        return t
+    if not t:
+        return m
+    if m.lower().startswith(t.lower().rstrip(".:")):
+        return m
+    return f"{t} — {m}"
+
+
+def agent_scheme(cfg: Any) -> str:
+    return "https" if getattr(cfg, "tls_certfile", None) else "http"
+
+
+def agent_ui_url(cfg: Any | None) -> str:
+    """Where the catalog's "Open app" button sends the operator's
+    browser: the agent's own web UI (``/demo``). ``agent_public_url``
+    when the operator set one (a LAN hostname, a reverse proxy);
+    otherwise the catalog's ``{host}`` placeholder — the hostname the
+    operator is browsing OpenNVR from — on the agent's port, which is
+    how the compose overlay publishes it."""
+    if cfg is None:
+        return "http://{host}:9100/demo"
+    public = (getattr(cfg, "agent_public_url", None) or "").rstrip("/")
+    if public:
+        return f"{public}/demo"
+    return f"{agent_scheme(cfg)}://{{host}}:{getattr(cfg, 'port', 9100)}/demo"
+
+
+def agent_manifest(cfg: Any | None = None) -> dict[str, Any]:
     """RFC-0002 gap 8 (contract parity): the flagship app's identity, in
     the same shape every SDK app serves. AppManifest is an identity
     dataclass, not a base class — the agent still doesn't ride
@@ -5060,6 +5660,10 @@ def agent_manifest() -> dict[str, Any]:
     ``requires_tasks`` is empty on purpose: every capability degrades
     gracefully (that's the agent's whole design), so nothing is a hard
     requirement the catalog should warn about.
+
+    The agent is a full application with its own web UI, so the manifest
+    declares ``ui_mode="external"``: the catalog shows an "Open app"
+    button to ``ui_url`` instead of trying to embed a sandboxed ``/ui``.
     """
     from opennvr_app_sdk import AppManifest
 
@@ -5074,7 +5678,25 @@ def agent_manifest() -> dict[str, Any]:
             "capability degrades gracefully when its backend is absent."
         ),
         requires_tasks=[],
+        has_ui=True,
+        ui_mode="external",
+        ui_url=agent_ui_url(cfg),
     ).to_dict()
+
+
+def _tracks_push_visible(pushed: Any) -> bool:
+    """May THIS session's socket receive ``pushed``?
+
+    A tracks push names a camera; it is honoured against the session's
+    per-camera scope exactly as the HTTP gate would honour a request, so
+    a viewer never receives boxes for a camera they may not watch. This
+    is the re-scoping the unscoped service ticket to core relies on.
+    Everything else on the socket is site-wide status and passes."""
+    tr = pushed.get("tracks") if isinstance(pushed, dict) else None
+    if not isinstance(tr, dict):
+        return True
+    scope = camera_scope()
+    return scope is None or tr.get("camera") in scope
 
 
 def build_app(runtime: CameraAgentRuntime) -> FastAPI:
@@ -5123,6 +5745,22 @@ def build_app(runtime: CameraAgentRuntime) -> FastAPI:
             return "operator"       # arm/create/ack/remove verbs
         return "viewer"             # look + chat (/ask, /converse, /say, GETs)
 
+    def _scoped_rules(rules: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Monitors/alarms the caller may see: every camera the rule
+        watches must be in their scope (a rule armed on the yard is not a
+        guard-of-the-gate's business, even if it also covers the gate)."""
+        return [r for r in rules
+                if all(camera_in_scope(str(c)) for c in (r.get("camera_ids") or []))]
+
+    def _rule_visible(rules: list[dict[str, Any]], rule_id: int) -> bool:
+        return any(int(r.get("id", -1)) == int(rule_id) for r in _scoped_rules(rules))
+
+    def _scoped_notes(notes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Alarm events / watch notifications for the caller's cameras
+        (an entry naming no camera reaches everyone)."""
+        return [n for n in notes
+                if not n.get("camera") or camera_in_scope(str(n.get("camera")))]
+
     @app.middleware("http")
     async def _auth_gate(request: Request, call_next):
         if runtime.cfg.auth_mode != "opennvr":
@@ -5153,7 +5791,23 @@ def build_app(runtime: CameraAgentRuntime) -> FastAPI:
                 status_code=403)
         request.state.agent_user = user
         request.state.agent_tier = tier
-        return await call_next(request)
+        # Per-camera RBAC: bind the caller's visible cameras for the rest
+        # of this request (tools, rings, roster — see context.CAMERA_SCOPE).
+        # Agent cameras not linked to a server camera are superuser-only,
+        # like the server's own owner-less cameras.
+        scope_token = set_camera_scope(await _scope_for(token, user))
+        try:
+            return await call_next(request)
+        finally:
+            reset_camera_scope(scope_token)
+
+    async def _scope_for(token: str, user: dict[str, Any]) -> set[str] | None:
+        server_ids = await runtime.auth.visible_cameras(token, user)
+        if server_ids is None:
+            return None
+        return {c.camera_id for c in runtime.cfg.cameras
+                if c.opennvr_camera_id is not None
+                and int(c.opennvr_camera_id) in server_ids}
 
     # ── Interactive priority ───────────────────────────────────────
     # Bracket a discrete voice/chat turn so background detection loops
@@ -5217,7 +5871,12 @@ def build_app(runtime: CameraAgentRuntime) -> FastAPI:
     async def _health() -> dict[str, Any]:
         return {
             "status": "ok",
-            "cameras": [cam.camera_id for cam in runtime.cfg.cameras],
+            # A count, not the handles: /health is an OPEN path on a port
+            # the demo UI publishes, and the roster is what /cameras
+            # (authenticated, per-user) is for. /state — the contract
+            # door the App Catalog proxies and scopes per viewer — still
+            # carries the handle list, like every SDK app's does.
+            "camera_count": len(runtime.cfg.cameras),
             # The tools actually ADVERTISED to the LLM (honours enabled_tools),
             # not every registered handler (test-report #4).
             "tools": [t["function"]["name"] for t in runtime.tool_definitions],
@@ -5239,7 +5898,7 @@ def build_app(runtime: CameraAgentRuntime) -> FastAPI:
 
     @app.get("/manifest")
     async def _manifest() -> dict[str, Any]:
-        return agent_manifest()
+        return agent_manifest(runtime.cfg)
 
     @app.get("/state")
     async def _state() -> dict[str, Any]:
@@ -5336,13 +5995,39 @@ def build_app(runtime: CameraAgentRuntime) -> FastAPI:
                 status_code=200), None
         return None, (token, path)
 
+    @app.get("/interruptions")
+    async def _interruptions() -> dict[str, Any]:
+        """The interruption gate on the streaming pipeline and its recent
+        decisions (viewer tier: look only). Tune from evidence: every
+        phrase spoken over the agent is here with why it did or did not
+        interrupt."""
+        cfg = runtime.cfg
+        return {
+            "mode": str(getattr(cfg, "interruptions", "gated")),
+            "min_ms": float(getattr(cfg, "interrupt_min_ms", 300.0)),
+            "min_words": int(getattr(cfg, "interrupt_min_words", 2)),
+            "addressee": bool(getattr(cfg, "interrupt_addressee", True)),
+            "recent": list(runtime.interruption_log)[-50:],
+        }
+
+    @app.get("/thinking-aloud")
+    async def _thinking_aloud() -> dict[str, Any]:
+        """The thinking-aloud gate and its recent decisions (viewer tier):
+        which tools got a line, which were too quick to need one."""
+        t = runtime.thinking
+        return {"enabled": t.enabled, "min_ms": t.min_ms, "source": t.source,
+                "expected_ms": {k: int(t.expected_wait_ms(k)) for k in
+                                ("describe_camera", "search_history", "search_footage", "recent_plates")},
+                "recent": list(t.recent)}
+
     @app.get("/alarm-defaults")
     async def _alarm_defaults() -> dict[str, Any]:
         """The merged target→level map + which entries are UI overrides
         (the editor edits ONLY the overrides; config/built-ins show as
         inherited)."""
         return {"defaults": runtime.ring_defaults(),
-                "overrides": dict(runtime._ring_overrides)}
+                "overrides": dict(runtime._ring_overrides),
+                "announce_app_alerts": runtime.announce_app_alerts()}
 
     @app.put("/alarm-defaults")
     async def _put_alarm_defaults(request: Request) -> JSONResponse:
@@ -5352,14 +6037,21 @@ def build_app(runtime: CameraAgentRuntime) -> FastAPI:
             body = await request.json()
         except Exception:
             body = {}
-        overrides = (body or {}).get("overrides")
+        body = body or {}
+        overrides = body.get("overrides", dict(runtime._ring_overrides))
         if not isinstance(overrides, dict):
             return JSONResponse({"error": "overrides must be a mapping of "
                                           "target -> siren|pulse|chime|silent"},
                                 status_code=400)
+        if "announce_app_alerts" in body:
+            try:
+                runtime.set_announce_app_alerts(body.get("announce_app_alerts"))
+            except ValueError as exc:
+                return JSONResponse({"error": str(exc)}, status_code=400)
         merged = runtime.set_ring_overrides(overrides)
         return JSONResponse({"defaults": merged,
-                             "overrides": dict(runtime._ring_overrides)})
+                             "overrides": dict(runtime._ring_overrides),
+                             "announce_app_alerts": runtime.announce_app_alerts()})
 
     @app.get("/events")
     async def _events() -> dict[str, Any]:
@@ -5402,11 +6094,15 @@ def build_app(runtime: CameraAgentRuntime) -> FastAPI:
             return {"available": True, "ok": False, "events": []}
         # Map server-side camera ids back to this agent's ids/roles so the
         # card can say "the front door", not "camera 7".
-        by_srv = {int(c.opennvr_camera_id): c for c in runtime.cfg.cameras
+        by_srv = {int(c.opennvr_camera_id): c for c in runtime.visible_cameras()
                   if c.opennvr_camera_id is not None}
         rows = []
         for e in events:
             spec = by_srv.get(int(e.camera_id))
+            if spec is None and camera_scope() is not None:
+                # The store is fleet-wide (internal key); a scoped caller
+                # gets only the visits on cameras they may see.
+                continue
             rows.append({
                 "id": e.id, "label": e.label,
                 "camera_id": spec.camera_id if spec else str(e.camera_id),
@@ -5514,7 +6210,7 @@ def build_app(runtime: CameraAgentRuntime) -> FastAPI:
         return {
             "cameras": [
                 {"camera_id": cam.camera_id, "role": cam.role}
-                for cam in runtime.cfg.cameras
+                for cam in runtime.visible_cameras()
             ]
         }
 
@@ -5537,7 +6233,7 @@ def build_app(runtime: CameraAgentRuntime) -> FastAPI:
         return {
             "added": [{"camera_id": c.camera_id, "frame_url": c.frame_url} for c in added],
             "cameras": [
-                {"camera_id": c.camera_id, "role": c.role} for c in runtime.cfg.cameras
+                {"camera_id": c.camera_id, "role": c.role} for c in runtime.visible_cameras()
             ],
         }
 
@@ -5603,6 +6299,31 @@ def build_app(runtime: CameraAgentRuntime) -> FastAPI:
         return JSONResponse({"restored": restored,
                              "skills": runtime.skills_payload()})
 
+    @app.post("/skills/app/{app_id}/speech")
+    async def _skill_app_speech(app_id: str, request: Request) -> JSONResponse:
+        """Speak this app's relayed alerts, or don't.
+
+        Per-app because the site-wide policy is the wrong grain for the
+        problem it was causing: an operator wants the doorbell to speak
+        and ANPR to stay quiet, not one switch for both. Body
+        {"speak": true|false} sets it; {"speak": null} clears the
+        override so the app follows the site policy again."""
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        speak = (body or {}).get("speak", None)
+        if speak is not None and not isinstance(speak, bool):
+            return JSONResponse({"error": "speak must be true, false or null"},
+                                status_code=400)
+        try:
+            runtime.set_app_announce(app_id, speak)
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        logger.info("app speech set: app:%s -> %s", app_id, speak)
+        return JSONResponse({"app_announce": runtime.app_announce_overrides(),
+                             "skills": runtime.skills_payload()})
+
     @app.post("/skills/{skill_id}/{action}")
     async def _skill_toggle(skill_id: str, action: str) -> JSONResponse:
         """Turn a skill on/off. This reconfigures the agent's live toolset, so
@@ -5612,12 +6333,19 @@ def build_app(runtime: CameraAgentRuntime) -> FastAPI:
                                 status_code=400)
         await runtime.kaic_capabilities.refresh()   # 60s TTL; never raises
         ok = runtime.set_skill_enabled(skill_id, action == "enable")
+        if not ok and skill_id.startswith("app:"):
+            return JSONResponse({"error": f"no installed app {skill_id[4:]!r} — "
+                                          "install and enable it in the App Catalog first"},
+                                status_code=404)
         if not ok:
             # Unknown skill, or its backend isn't configured yet.
             skill = next((s for s in runtime.skills_payload() if s["id"] == skill_id), None)
             if skill is None:
                 return JSONResponse({"error": f"unknown skill {skill_id!r}"},
                                     status_code=404)
+            if action == "disable":
+                return JSONResponse({"error": "skill can't be disabled", "hint": skill["hint"]},
+                                    status_code=409)
             return JSONResponse(
                 {"error": "skill can't be enabled yet", "hint": skill["hint"]},
                 status_code=409)
@@ -5665,9 +6393,12 @@ def build_app(runtime: CameraAgentRuntime) -> FastAPI:
         return JSONResponse({"delivered": ok, "channels": runtime.notifier.status()["channels"]})
 
     @app.get("/intro")
-    async def _intro() -> JSONResponse:
-        """The agent's greeting — text always; audio when Piper is reachable."""
-        greeting = greeting_for(runtime.agent_name)
+    async def _intro(hour: int | None = None) -> JSONResponse:
+        """The agent's greeting — text always; audio when Piper is reachable.
+        ``?hour=<0-23>`` is the operator's local hour (the browser's clock)
+        so a remote operator hears the right time of day; without it the
+        site's clock decides."""
+        greeting = greeting_for(runtime.agent_name, hour)
         audio_b64 = None
         try:
             audio = await runtime.piper.synthesize(greeting)
@@ -5720,8 +6451,8 @@ def build_app(runtime: CameraAgentRuntime) -> FastAPI:
     async def _monitors() -> dict[str, Any]:
         """Standing monitors + any new notifications (UI polls this)."""
         return {
-            "monitors": runtime.monitors.list(),
-            "notifications": runtime.monitors.notifications(),
+            "monitors": _scoped_rules(runtime.monitors.list()),
+            "notifications": _scoped_notes(runtime.monitors.notifications()),
         }
 
     @app.post("/monitors")
@@ -5734,12 +6465,16 @@ def build_app(runtime: CameraAgentRuntime) -> FastAPI:
         msg = await runtime._handle_create_monitor(body or {})
         if msg.startswith("ERROR:") or msg.endswith("?"):
             return JSONResponse({"error": msg}, status_code=400)
-        return JSONResponse({"message": msg, "monitors": runtime.monitors.list()}, status_code=202)
+        return JSONResponse({"message": msg,
+                             "monitors": _scoped_rules(runtime.monitors.list())},
+                            status_code=202)
 
     @app.delete("/monitors/{monitor_id}")
     async def _stop_monitor(monitor_id: int) -> JSONResponse:
         """The UI's ✕: stop AND forget — idempotent, same contract as
         DELETE /alarms/{id} (already-gone is success)."""
+        if not _rule_visible(runtime.monitors.list(), monitor_id):
+            return JSONResponse({"stopped": False, "already_gone": True})
         ok = runtime.monitors.remove(monitor_id)
         runtime.persist()
         return JSONResponse({"stopped": ok, "already_gone": not ok})
@@ -5748,10 +6483,10 @@ def build_app(runtime: CameraAgentRuntime) -> FastAPI:
     async def _alarms() -> dict[str, Any]:
         """Armed alarms + recent trigger events (UI polls; rings while any
         alarm is triggered)."""
-        alarms = runtime.alarms.list()
+        alarms = _scoped_rules(runtime.alarms.list())
         return {
             "alarms": alarms,
-            "events": runtime.alarms.events(),
+            "events": _scoped_notes(runtime.alarms.events()),
             # Ring only for ACTIVE, triggered alarms. list() also returns
             # disarmed ones; without the active check a stale triggered flag on a
             # disarmed alarm left the siren banner up while the panel showed
@@ -5801,7 +6536,9 @@ def build_app(runtime: CameraAgentRuntime) -> FastAPI:
         msg = await runtime._handle_create_alarm(body or {})
         if msg.startswith("ERROR:") or msg.endswith("?"):
             return JSONResponse({"error": msg}, status_code=400)
-        return JSONResponse({"message": msg, "alarms": runtime.alarms.list()}, status_code=202)
+        return JSONResponse({"message": msg,
+                             "alarms": _scoped_rules(runtime.alarms.list())},
+                            status_code=202)
 
     @app.post("/alarms/ack")
     async def _ack_alarms(request: Request) -> JSONResponse:
@@ -5811,7 +6548,14 @@ def build_app(runtime: CameraAgentRuntime) -> FastAPI:
         except Exception:
             body = {}
         aid = body.get("alarm_id")
-        n = runtime.alarms.acknowledge(int(aid) if aid is not None else None)
+        if aid is not None:
+            if not _rule_visible(runtime.alarms.list(), int(aid)):
+                return JSONResponse({"silenced": 0})
+            return JSONResponse({"silenced": runtime.alarms.acknowledge(int(aid))})
+        # "Silence everything" silences MY alarms — the ones on cameras I
+        # can see; someone else's yard alarm keeps ringing for them.
+        n = sum(runtime.alarms.acknowledge(int(a["id"]))
+                for a in _scoped_rules(runtime.alarms.list()))
         return JSONResponse({"silenced": n})
 
     @app.delete("/alarms/{alarm_id}")
@@ -5824,6 +6568,8 @@ def build_app(runtime: CameraAgentRuntime) -> FastAPI:
         'couldn't remove' six times for an alarm that WAS removed —
         alarming (sic) and wrong. Deletion's contract is 'make it not
         exist', and it already doesn't."""
+        if not _rule_visible(runtime.alarms.list(), alarm_id):
+            return JSONResponse({"stopped": False, "already_gone": True})
         ok = runtime.alarms.remove(alarm_id)
         runtime.persist()
         return JSONResponse({"stopped": ok, "already_gone": not ok})
@@ -5916,7 +6662,7 @@ def build_app(runtime: CameraAgentRuntime) -> FastAPI:
         if not text:
             return JSONResponse({"error": "text is required"}, status_code=400)
 
-        configured = {cam.camera_id for cam in runtime.cfg.cameras}
+        configured = {cam.camera_id for cam in runtime.visible_cameras()}
         camera_hint = None
         for part in str((body or {}).get("camera") or "").split(","):
             part = part.strip()
@@ -5961,11 +6707,13 @@ def build_app(runtime: CameraAgentRuntime) -> FastAPI:
                 runtime, demo_history, text, preferred_camera=camera_hint,
                 tool_definitions=runtime.tools_for_tier(
                     getattr(request.state, "agent_tier", "admin")),
+                speak_progress="text",
             )
             # Capture "what I saw" while the pin is still visible — a
             # racing thumbnail fetch may have overwritten the cache seed,
             # and the chat must show the frame the answer was ABOUT.
             frames = _frames_for(runtime)
+            runtime.thinking.record_stages(runtime.last_turn_trace)
         except LLMTurnError as exc:
             # The diagnosis IS the message (issue #344): "model X not found,
             # try pulling it first" must reach the operator, not the log.
@@ -6036,7 +6784,7 @@ def build_app(runtime: CameraAgentRuntime) -> FastAPI:
         # UI-selected camera hint: one id, a comma list, or "all". Use the
         # first concrete configured camera as the grounding default; "all"
         # or empty leaves it to the agent.
-        configured = {cam.camera_id for cam in runtime.cfg.cameras}
+        configured = {cam.camera_id for cam in runtime.visible_cameras()}
         raw_hint = request.query_params.get("camera") or ""
         camera_hint = None
         for part in raw_hint.split(","):
@@ -6131,6 +6879,7 @@ def build_app(runtime: CameraAgentRuntime) -> FastAPI:
                 runtime, demo_history, question, preferred_camera=camera_hint,
                 tool_definitions=runtime.tools_for_tier(
                     getattr(request.state, "agent_tier", "admin")),
+                speak_progress="voice",
             ), name="converse-turn")
             _inflight["turn"] = turn
             try:
@@ -6194,6 +6943,7 @@ def build_app(runtime: CameraAgentRuntime) -> FastAPI:
                         "adapter (docker logs, /health); text-only reply")
         _mark("tts", t3)
         timings["total"] = int((_t.perf_counter() - t0) * 1000)
+        runtime.thinking.record_stages(runtime.last_turn_trace, timings)
         # Log the per-stage breakdown so a slow turn can be diagnosed straight
         # from the agent logs (grep "converse: timings_ms") instead of only the
         # browser's Network tab: transcode / stt / llm / tts / total, in ms.
@@ -6238,10 +6988,25 @@ def build_app(runtime: CameraAgentRuntime) -> FastAPI:
             if _user is None:
                 await websocket.close(code=4401)   # 4401 = auth required
                 return
+            # Same per-camera scope as the HTTP gate, for the life of the
+            # voice session (the pipeline's tool calls run in this task).
+            set_camera_scope(await _scope_for(_tok, _user))
         await websocket.accept()
         last: str | None = None
+        inbox = runtime.subscribe_updates()
         try:
             while True:
+                # Anything published (a "working" line while a tool runs)
+                # goes out at once; the panel diff below every 2 s.
+                try:
+                    pushed = await asyncio.wait_for(inbox.get(), timeout=2.0)
+                except asyncio.TimeoutError:
+                    pushed = None
+                if pushed is not None:
+                    if not _tracks_push_visible(pushed):
+                        continue
+                    await websocket.send_text(json.dumps(pushed, default=str))
+                    continue
                 alarms = runtime.alarms.list()
                 payload = {
                     "tasks": {"tasks": runtime.tasks.list()},
@@ -6269,11 +7034,12 @@ def build_app(runtime: CameraAgentRuntime) -> FastAPI:
                 if text != last:
                     await websocket.send_text(text)
                     last = text
-                await asyncio.sleep(2.0)
         except Exception:
             # Disconnect (or send on a closed socket) ends the loop; the page
             # reconnects with backoff and polls in the meantime.
             return
+        finally:
+            runtime.unsubscribe_updates(inbox)
 
     @app.websocket("/ws")
     async def _ws(websocket: WebSocket) -> None:
@@ -6296,12 +7062,10 @@ def build_app(runtime: CameraAgentRuntime) -> FastAPI:
                 await websocket.close(code=4401)   # 4401 = auth required
                 return
         # Lazy-imported so the module loads without Pipecat installed.
-        from pipecat.transports.network.fastapi_websocket import (
+        from pipecat.transports.websocket.fastapi import (
             FastAPIWebsocketParams,
             FastAPIWebsocketTransport,
         )
-        from pipecat.audio.vad.silero import SileroVADAnalyzer
-        from pipecat.audio.vad.vad_analyzer import VADParams
         from serializer import RawPcmSerializer
 
         await websocket.accept()
@@ -6321,24 +7085,15 @@ def build_app(runtime: CameraAgentRuntime) -> FastAPI:
                 audio_out_sample_rate=22050,
                 audio_out_channels=1,
                 add_wav_header=False,
-                vad_enabled=True,
-                vad_analyzer=SileroVADAnalyzer(
-                    sample_rate=16000,
-                    params=VADParams(
-                        confidence=0.55,
-                        start_secs=0.15,
-                        stop_secs=0.7,
-                        min_volume=0.08,
-                    ),
-                ),
-                vad_audio_passthrough=True,
+                # VAD and turn-taking live on the user aggregator now
+                # (build_pipeline_task) — the transport just moves audio.
                 serializer=RawPcmSerializer(),
             ),
         )
 
         task = build_pipeline_task(runtime, transport)
-        from pipecat.pipeline.runner import PipelineRunner
-        runner = PipelineRunner(handle_sigint=False)
+        from pipecat.workers.runner import WorkerRunner
+        runner = WorkerRunner(handle_sigint=False)
         try:
             await runner.run(task)
         except Exception:
@@ -6761,9 +7516,12 @@ async def _run_conversation_turn(
     max_iterations: int = 4,
     preferred_camera: str | None = None,
     tool_definitions: list[dict[str, Any]] | None = None,
+    speak_progress: str | None = None,
 ) -> str:
     """Run the tool-calling LLM loop for one user utterance and return the
-    final spoken reply. ``history`` holds prior user/assistant text turns
+    final spoken reply. ``speak_progress``: "voice" / "text" for an
+    interactive turn (the agent may think aloud — fillers.py — before a
+    slow tool; audio only for voice), None for background work. ``history`` holds prior user/assistant text turns
     (tool internals are kept turn-local, not persisted).
 
     Anti-fabrication guard: small CPU models sometimes answer a camera
@@ -6778,13 +7536,13 @@ async def _run_conversation_turn(
     # are instant: previously they ran the full tool loop (tens of seconds on a
     # CPU model) only to have the roster answer override the result at the end.
     if _is_config_question(user_text):
-        return _roster_answer(runtime.cfg.cameras)
+        return _roster_answer(runtime.visible_cameras())
 
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": runtime.build_system_prompt()}
     ]
     tools = tool_definitions if tool_definitions is not None else runtime.tool_definitions
-    cameras = [cam.camera_id for cam in runtime.cfg.cameras]
+    cameras = [cam.camera_id for cam in runtime.visible_cameras()]
     # UI-selected camera: when the user doesn't name one, bias the model
     # toward the camera the operator picked in the dropdown.
     if preferred_camera and preferred_camera in cameras:
@@ -6805,6 +7563,29 @@ async def _run_conversation_turn(
     # explains itself. Overwritten each turn (turns are serialized).
     trace: list[dict[str, Any]] = []
     runtime.last_turn_trace = trace
+    thinking = getattr(runtime, "thinking", None)
+    if thinking is not None:
+        thinking.new_turn()
+
+    def _think_aloud(call: dict[str, Any], model_line: str) -> None:
+        """Say what the first slow tool is about to do — in parallel with it."""
+        if thinking is None or not speak_progress:
+            return
+        func = call.get("function") or {}
+        name = str(func.get("name") or "")
+        raw = func.get("arguments")
+        try:
+            args = json.loads(raw) if isinstance(raw, str) and raw.strip() else (raw if isinstance(raw, dict) else {})
+        except (json.JSONDecodeError, ValueError):
+            args = {}
+        try:
+            line = thinking.line_for(name, args, cameras=runtime.visible_cameras(), model_line=model_line)
+        except Exception:  # noqa: BLE001
+            line = None
+        if line:
+            logger.info("thinking aloud (%s): %r", name, line)
+            asyncio.create_task(runtime.say_working(line, voice=(speak_progress == "voice")),
+                                name="thinking-aloud")
 
     final = ""
     grounded = False   # did any tool actually run this turn?
@@ -6839,6 +7620,7 @@ async def _run_conversation_turn(
                 "role": "assistant", "content": content, "tool_calls": tool_calls,
             })
             for call in tool_calls:
+                _think_aloud(call, content)
                 name, result = await _invoke_tool(runtime, call)
                 logger.info("converse: tool %s -> %s", name, result[:120])
                 tools_called += 1
@@ -6885,6 +7667,7 @@ async def _run_conversation_turn(
                 "id": "forced-0", "type": "function",
                 "function": {"name": tool_name, "arguments": tool_args},
             }
+            _think_aloud(call, "")
             name, result = await _invoke_tool(runtime, call)
             logger.info("converse: FORCED grounding (%s) on %s -> %s",
                         tool_name, cam, result[:120])
@@ -6908,18 +7691,18 @@ async def _run_conversation_turn(
     # reasoning) but a tool ran, surface that result. For camera-roster/config
     # questions, answer deterministically — small models often just deflect
     # ("I'll check…") and there's no tool to ground them.
-    cleaned = _clean_for_speech(final, runtime.cfg.cameras)
+    cleaned = _clean_for_speech(final, runtime.visible_cameras())
     if _is_config_question(user_text):
         # Roster/config questions ("how many cameras are configured?") are
         # answered deterministically and FIRST — the model can't reliably count
         # the configured cameras and often narrates a tool it never called
         # ("…calling detect_objects to check…"). The roster is authoritative, so
         # don't let that narration through as the answer.
-        reply, source = _roster_answer(runtime.cfg.cameras), "roster"
+        reply, source = _roster_answer(runtime.visible_cameras()), "roster"
     elif cleaned and not _is_deflection(cleaned):
         reply, source = cleaned, "llm"
     elif last_tool_result:
-        reply, source = _humanize_for_speech(last_tool_result, runtime.cfg.cameras), "tool_fallback"
+        reply, source = _humanize_for_speech(last_tool_result, runtime.visible_cameras()), "tool_fallback"
     else:
         reply, source = (cleaned or "Sorry, I'm having trouble answering that right now."), "none"
 
@@ -7050,6 +7833,7 @@ def main(argv: list[str] | None = None) -> int:
     cfg = load_config(args.config)
     runtime = CameraAgentRuntime(cfg)
     app = build_app(runtime)
+    logger.info("turn-taking: %s", describe_turn_profile(cfg))
 
     import uvicorn
     config = uvicorn.Config(

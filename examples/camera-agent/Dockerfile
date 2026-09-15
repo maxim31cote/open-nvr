@@ -27,12 +27,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# Pin Pipecat carefully — its API has shifted between minor versions.
-# The upper bound MUST stay <0.0.60: 0.0.10x removed FrameSerializerType
-# and reworked the InputAudioRawFrame constructor, both of which
-# serializer.py / the RawPcmSerializer depend on. Keep this in lock-step
-# with pyproject.toml. If you bump these, re-run the example's test suite
-# and the demo page locally before committing.
+# Pin Pipecat carefully — its API has shifted between minor versions
+# (the 1.x line moved turn-taking into the user aggregator and the
+# serializer/transport modules; camera_agent.py, services.py and
+# serializer.py are written against 1.8). Keep this in lock-step with
+# pyproject.toml. If you bump these, re-run the example's test suite
+# (tests/test_pipeline_e2e.py drives the real pipeline) and the demo page
+# locally before committing.
 # Resilient install for slow / flaky PyPI links (pipecat's silero extra pulls
 # torch — a large download). Three layers of resilience:
 #   * --mount=type=cache keeps the pip wheel cache across build attempts, so a
@@ -45,7 +46,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     for i in 1 2 3 4 5; do \
         echo "pip install attempt $i/5..."; \
         pip install --timeout 300 --retries 10 \
-            "pipecat-ai[silero,websocket]>=0.0.55,<0.0.60" \
+            "pipecat-ai[silero,websocket]>=1.8.1,<2.0" \
             "httpx>=0.27,<1.0" \
             "fastapi>=0.110,<1.0" \
             "uvicorn>=0.27,<1.0" \
@@ -57,6 +58,25 @@ RUN --mount=type=cache,target=/root/.cache/pip \
         if [ "$i" = 5 ]; then echo "pip install failed after 5 attempts" >&2; exit 1; fi; \
         echo "attempt $i failed; retrying in 15s..."; sleep 15; \
     done
+
+# Pipecat's TTS sentence aggregation uses NLTK's punkt_tab tokenizer and
+# downloads it on first use — which a sovereign, offline site cannot do,
+# and which would otherwise delay the first spoken reply. Bundle it at
+# build time; NLTK_DATA points the runtime at it. Smart Turn v3 and the
+# Silero VAD ship inside the pipecat wheel already (no download).
+ENV NLTK_DATA=/opt/nltk_data
+RUN python -m nltk.downloader -d /opt/nltk_data punkt_tab
+
+# CPU fit. The only heavy math in THIS container is Smart Turn v3's
+# end-of-turn verdict (once per pause: an 8 s log-mel in numpy + a small
+# ONNX model) and Silero VAD (~0.7% of a core). Left uncapped, numpy's
+# BLAS/OpenMP fans the log-mel across every core, which measured SLOWER
+# on a 4-core box (90–130 ms vs ~60 ms single-threaded) and competes with
+# Whisper/Piper/Ollama next door. camera_agent.py sets the same defaults
+# when these are absent; here so `docker run -e` overrides are explicit.
+# onnxruntime's own pool is sized by `turn_cpu_threads` in config.yml
+# (auto: 1 thread, 2 from 8 cores) — see MODELS_AND_LATENCY.md.
+ENV OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1
 
 # The OpenNVR App SDK — monitor_host.py (the create_monitor convergence)
 # imports opennvr_app_sdk, and the count/crossing rule libraries below are
@@ -72,6 +92,8 @@ COPY examples/camera-agent/frame_sources.py   ./frame_sources.py
 COPY examples/camera-agent/serializer.py      ./serializer.py
 COPY examples/camera-agent/services.py        ./services.py
 COPY examples/camera-agent/tools.py           ./tools.py
+COPY examples/camera-agent/turns.py           ./turns.py
+COPY examples/camera-agent/fillers.py         ./fillers.py
 COPY examples/camera-agent/footage_index.py   ./footage_index.py
 COPY examples/camera-agent/monitor_host.py    ./monitor_host.py
 COPY examples/camera-agent/system_check.py    ./system_check.py

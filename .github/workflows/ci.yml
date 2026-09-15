@@ -56,6 +56,29 @@ jobs:
       - name: Run pytest
         working-directory: server
         run: uv run pytest tests/ -q
+      # The two stdlib-only sidecars next to core: the privileged
+      # installer's reconciler and the apps' egress proxy. Same venv —
+      # they need nothing but pytest (and PyYAML for the index).
+      - name: Sidecars (app-installer, egress-proxy)
+        run: server/.venv/bin/python -m pytest -q -p no:cacheprovider scripts/app-installer/tests scripts/egress-proxy/tests
+
+  # ── App SDK ──────────────────────────────────────────────────────
+  # The examples exercise the SDK indirectly; this runs its own suite
+  # (the platform client, credentials, user context, contract server,
+  # the sync/async parity check). publish-sdk.yml runs the same across
+  # 3.11–3.13 plus the build on sdk/** changes.
+  sdk:
+    name: sdk (pytest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: "sdk/opennvr-app-sdk/uv.lock"
+      - name: Run pytest
+        working-directory: sdk/opennvr-app-sdk
+        run: uv run --frozen --group dev pytest -q
 
   # ── KAI-C middleware ─────────────────────────────────────────────
   # kai-c/ uses [dependency-groups] for dev deps (pytest + pytest-
@@ -115,9 +138,11 @@ jobs:
       matrix:
         example:
           - abandoned-object
+          - alert-notifier
           - alerts-subscriber
           - camera-agent
           - footage-search
+          - gate-controller
           - home-assistant-relay
           - inference-listener
           - intrusion-detection
@@ -138,6 +163,12 @@ jobs:
       - name: Run pytest
         working-directory: examples/${{ matrix.example }}
         run: uv run pytest -q
+      # What a listing reviewer checks, on every example, every PR
+      # (the camera-agent is an agent, not a catalog app — no manifest).
+      - name: opennvr-app validate
+        if: matrix.example != 'camera-agent'
+        working-directory: examples/${{ matrix.example }}
+        run: uv run opennvr-app validate .
 
   # ── React frontend build ─────────────────────────────────────────
   frontend:
@@ -153,6 +184,11 @@ jobs:
       - name: Install dependencies
         working-directory: app
         run: npm ci
+      # vite build does not typecheck (esbuild strips types), so a type
+      # error can ship unnoticed — tsc is the gate for that.
+      - name: Typecheck
+        working-directory: app
+        run: npm run typecheck
       - name: Build
         working-directory: app
         run: npm run build
